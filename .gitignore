@@ -1,0 +1,7 @@
+# Build artifacts — regenerated, never committed.
+*.zip
+__pycache__/
+*.pyc
+# Icon PNGs are generated from winlinx.svg by render_icon.py (and by
+# the installer at install time). The SVG is the source of truth.
+winlinx/icons/*.png

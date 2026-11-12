@@ -1,0 +1,96 @@
+#!/bin/bash
+# WinLinx — double-click handler for Windows files.
+#
+# .exe / .msi  -> scanned first, then run with Wine
+# .vst3 / .dll -> scanned first, then copied to the Wine VST folder
+#                and bridged with yabridgectl sync
+#
+# A flagged file is moved to quarantine and NEVER runs. The user
+# decides its fate in the WinLinx Program Manager.
+# The scan decision lives in scanner.py (one gate, used by the
+# watcher and by this runner alike).
+
+FILE="$1"
+[ -z "$FILE" ] && exit 0
+LAYER="$HOME/.local/share/winlinx"
+LOG="$LAYER/layer.log"
+
+say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG" 2>/dev/null; }
+
+notify() {
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --warning --no-wrap --text="$1" 2>/dev/null &
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "WinLinx" "$1" 2>/dev/null &
+    fi
+}
+
+find_yabridgectl() {
+    if command -v yabridgectl >/dev/null 2>&1; then
+        command -v yabridgectl
+    elif [ -x "$HOME/.local/share/yabridge/yabridgectl" ]; then
+        echo "$HOME/.local/share/yabridge/yabridgectl"
+    fi
+}
+
+EXT="$(echo "${FILE##*.}" | tr '[:upper:]' '[:lower:]')"
+NAME="$(basename "$FILE")"
+
+case "$EXT" in
+    exe|msi|vst3|dll) ;;
+    *) exit 0 ;;
+esac
+
+# --- scan gate (scanner.py exits 0 clean, 1 quarantined, 2 unscanned)
+if [ -f "$LAYER/scanner.py" ] && command -v python3 >/dev/null 2>&1; then
+    SCAN_OUT="$(python3 "$LAYER/scanner.py" gate "$FILE" 2>/dev/null)"
+    SCAN_CODE=$?
+    if [ "$SCAN_CODE" = "1" ]; then
+        say "QUARANTINED (double-click) $NAME: $SCAN_OUT"
+        notify "$NAME was quarantined and did not run: $SCAN_OUT — see the WinLinx Program Manager."
+        exit 0
+    elif [ "$SCAN_CODE" = "2" ]; then
+        say "WARNING: $NAME went through UNSCANNED ($SCAN_OUT)"
+    else
+        say "Scan clean (double-click): $NAME"
+    fi
+else
+    say "WARNING: $NAME went through UNSCANNED (scanner not found)"
+fi
+
+case "$EXT" in
+    exe|msi)
+        if ! command -v wine >/dev/null 2>&1; then
+            say "WARNING: Wine is not installed, cannot run $NAME"
+            notify "Wine is not installed, so $NAME cannot run."
+            exit 0
+        fi
+        say "Running (double-click): $NAME"
+        wine "$FILE" >/dev/null 2>&1 &
+        ;;
+    vst3)
+        DEST="$HOME/.wine/drive_c/Program Files/Common Files/VST3"
+        mkdir -p "$DEST"
+        cp "$FILE" "$DEST/" 2>/dev/null \
+            && say "Copied $NAME to $DEST" \
+            || { say "ERROR copying $NAME"; exit 0; }
+        CTL="$(find_yabridgectl)"
+        [ -n "$CTL" ] && "$CTL" sync >/dev/null 2>&1 \
+            && say "Bridges re-synced" \
+            || say "WARNING: bridge sync failed"
+        notify "$NAME was bridged into ~/.vst3 for your DAW."
+        ;;
+    dll)
+        DEST="$HOME/.wine/drive_c/Program Files/Common Files/VST2"
+        mkdir -p "$DEST"
+        cp "$FILE" "$DEST/" 2>/dev/null \
+            && say "Copied $NAME to $DEST" \
+            || { say "ERROR copying $NAME"; exit 0; }
+        CTL="$(find_yabridgectl)"
+        [ -n "$CTL" ] && "$CTL" sync >/dev/null 2>&1 \
+            && say "Bridges re-synced" \
+            || say "WARNING: bridge sync failed"
+        notify "$NAME was bridged into ~/.vst for your DAW."
+        ;;
+esac
+exit 0

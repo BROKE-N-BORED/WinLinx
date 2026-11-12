@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=WinLinx Program Manager
+Comment=Manage Windows programs and plug-ins on Linux
+Exec=/usr/bin/python3 @HOME@/.local/share/winlinx/manager.py
+Icon=@HOME@/.local/share/winlinx/icons/winlinx-256.png
+Terminal=false
+Categories=Utility;
