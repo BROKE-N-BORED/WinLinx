@@ -5,3 +5,17 @@ __pycache__/
 # Icon PNGs are generated from winlinx.svg by render_icon.py (and by
 # the installer at install time). The SVG is the source of truth.
 winlinx/icons/*.png
+# Secrets — NEVER in code, NEVER in the repo (immutable rule).
+# Sensitive info and API keys live in gitignored files only.
+.env
+.env.*
+*.env
+providers.json
+*credentials*
+*secret*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+*.kdbx
