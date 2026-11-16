@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke-test the WinLinx installer window offscreen (dry run).
 
-Launches the window, screenshots it, clicks Install (dry run — no
+Launches the window, screenshots it, clicks Install (dry run - no
 privileged commands, no writes), waits for the worker to finish,
 screenshots the done state. Screenshots land in /tmp/winlinx-installer-*.png
 

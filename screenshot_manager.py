@@ -58,6 +58,19 @@ def build_rich_home():
         bad = FAKE_HOME / name
         bad.write_bytes(b"x")
         scanner.quarantine_item(bad, [(str(bad), threat)])
+    # A failed drop (Wine missing) for the Failed Drops tab.
+    import json
+    state_path = FAKE_HOME / ".local" / "share" / "winlinx" / "handled.json"
+    failed_game = FAKE_HOME / "WinLinx" / "Programs" / "broken-game.exe"
+    failed_game.write_bytes(b"X" * 128)
+    st = failed_game.stat()
+    state = {str(failed_game): {
+        "size": st.st_size, "mtime": st.st_mtime_ns,
+        "action": "failed", "reason": "Wine is not installed",
+        "attempts": 2, "next_retry": 0,
+        "time": "2026-11-12T09:04:00"}}
+    state_path.write_text(json.dumps(state, indent=2),
+                          encoding="utf-8")
     # Richer log.
     log = (FAKE_HOME / ".local" / "share" / "winlinx" / "layer.log")
     with open(log, "a", encoding="utf-8") as fh:
@@ -80,7 +93,8 @@ def main():
         time.sleep(0.05)
     app.processEvents()
     for index, name in ((0, "programs"), (1, "plugins"),
-                        (2, "quarantine"), (3, "system")):
+                        (2, "quarantine"), (3, "failed"),
+                        (4, "activity"), (5, "system")):
         window.tabs.setCurrentIndex(index)
         app.processEvents()
         time.sleep(0.2)

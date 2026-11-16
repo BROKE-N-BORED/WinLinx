@@ -139,6 +139,48 @@ class QuarantineTests(ScannerTestBase):
                             str(scanner.quarantine_dir() / "dup.exe"))
         self.assertEqual(len(scanner.load_quarantine()), 2)
 
+    def test_quarantine_id_unique_same_name_same_second(self):
+        # Regression: ids used to be timestamp-second + file name, so
+        # two same-name files quarantined in the same second shared
+        # an id - and deleting one deleted both.
+        first = self.home / "a" / "nasty.exe"
+        first.parent.mkdir()
+        first.write_bytes(b"1")
+        entry1 = scanner.quarantine_item(
+            first, [(str(first), "T")])
+        second = self.home / "b" / "nasty.exe"
+        second.parent.mkdir()
+        second.write_bytes(b"2")
+        entry2 = scanner.quarantine_item(
+            second, [(str(second), "T")])
+        self.assertNotEqual(entry1["id"], entry2["id"])
+        self.assertEqual(len(scanner.load_quarantine()), 2)
+        # Deleting one leaves the other (entry and file) untouched.
+        self.assertTrue(scanner.delete_quarantined(entry1["id"]))
+        remaining = scanner.load_quarantine()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["id"], entry2["id"])
+        self.assertTrue(Path(entry2["quarantined"]).exists())
+        self.assertFalse(Path(entry1["quarantined"]).exists())
+
+    def test_allow_one_of_two_same_name_items(self):
+        first = self.home / "a" / "dup.exe"
+        first.parent.mkdir()
+        first.write_bytes(b"1")
+        entry1 = scanner.quarantine_item(
+            first, [(str(first), "T")])
+        second = self.home / "b" / "dup.exe"
+        second.parent.mkdir()
+        second.write_bytes(b"2")
+        entry2 = scanner.quarantine_item(
+            second, [(str(second), "T")])
+        restored = scanner.allow_item(entry1)
+        self.assertEqual(restored, first)
+        remaining = scanner.load_quarantine()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["id"], entry2["id"])
+        self.assertTrue(Path(entry2["quarantined"]).exists())
+
     def test_allowlist_flow(self):
         target = self.home / "infected.exe"
         target.write_bytes(b"content")

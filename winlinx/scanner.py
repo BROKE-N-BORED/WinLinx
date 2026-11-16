@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -175,8 +176,12 @@ def quarantine_item(src_path, threats):
         dest = qdir / ("%s (%d)%s" % (src.stem, n, src.suffix))
     shutil.move(str(src), str(dest))
     entry = {
-        "id": "%s-%s" % (datetime.now().strftime("%Y%m%d%H%M%S"),
-                         src.name),
+        # Unique id: microsecond timestamp + random hex. Two files
+        # with the same name quarantined in the same second used to
+        # share an id, and deleting one deleted both.
+        "id": "%s-%s-%s" % (
+            datetime.now().strftime("%Y%m%d%H%M%S%f"),
+            uuid.uuid4().hex[:8], src.name),
         "name": src.name,
         "original": str(src),
         "quarantined": str(dest),
@@ -192,25 +197,47 @@ def quarantine_item(src_path, threats):
 
 
 def delete_quarantined(entry_id):
-    """Permanently delete a quarantined item and its manifest entry."""
+    """Permanently delete ONE quarantined item (the first entry with
+    this id) and its manifest entry. The quarantined file is only
+    deleted when it is actually inside the quarantine folder."""
     items = _load_json(manifest_path(), [])
     kept = []
     deleted = False
+    qdir = quarantine_dir().resolve()
     for entry in items:
-        if entry.get("id") == entry_id:
+        if not deleted and entry.get("id") == entry_id:
             target = Path(entry["quarantined"])
             try:
-                if target.is_dir() and not target.is_symlink():
-                    shutil.rmtree(target)
-                elif target.exists() or target.is_symlink():
-                    target.unlink()
+                inside = qdir in target.resolve().parents \
+                    or target.resolve() == qdir
             except OSError:
-                pass
+                inside = False
+            if inside:
+                try:
+                    if target.is_dir() and not target.is_symlink():
+                        shutil.rmtree(target)
+                    elif target.exists() or target.is_symlink():
+                        target.unlink()
+                except OSError:
+                    pass
             deleted = True
         else:
             kept.append(entry)
     _save_json(manifest_path(), kept)
     return deleted
+
+
+def _drop_one_entry(entry_id):
+    """Remove exactly one manifest entry with this id (the first)."""
+    items = _load_json(manifest_path(), [])
+    kept = []
+    dropped = False
+    for entry in items:
+        if not dropped and entry.get("id") == entry_id:
+            dropped = True
+        else:
+            kept.append(entry)
+    _save_json(manifest_path(), kept)
 
 
 # ---------------------------------------------------------------- allowlist
@@ -245,9 +272,7 @@ def allow_item(entry):
     Returns the restored Path, or None if the quarantined copy is gone."""
     target = Path(entry["quarantined"])
     if not target.exists():
-        items = [e for e in _load_json(manifest_path(), [])
-                 if e.get("id") != entry.get("id")]
-        _save_json(manifest_path(), items)
+        _drop_one_entry(entry.get("id"))
         return None
     data = _load_allowlist()
     if target.is_dir():
@@ -270,9 +295,7 @@ def allow_item(entry):
         dest = original.with_name("%s (%d)%s" % (original.stem, n,
                                                  original.suffix))
     shutil.move(str(target), str(dest))
-    items = [e for e in _load_json(manifest_path(), [])
-             if e.get("id") != entry.get("id")]
-    _save_json(manifest_path(), items)
+    _drop_one_entry(entry.get("id"))
     return dest
 
 
@@ -296,7 +319,10 @@ def gate_cli(path):
 
 if __name__ == "__main__":
     import sys
+    if len(sys.argv) == 2 and sys.argv[1] in ("--version", "-V"):
+        print("WinLinx scanner %s" % common.__version__)
+        sys.exit(0)
     if len(sys.argv) == 3 and sys.argv[1] == "gate":
         sys.exit(gate_cli(sys.argv[2]))
-    print("usage: scanner.py gate <path>")
+    print("usage: scanner.py [--version | gate <path>]")
     sys.exit(2)

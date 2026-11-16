@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WinLinx GUI installer — native Qt window, no terminal needed.
+"""WinLinx GUI installer - native Qt window, no terminal needed.
 
 Double-click "Install WinLinx" in the extracted folder. It performs
 the same steps as install.sh (Wine, ClamAV, yabridge, PySide6, Wine
@@ -8,14 +8,14 @@ for the admin password through pkexec whenever a step needs it.
 
 Warn-never-refuse, like install.sh: a failed step is logged and the
 install carries on; the window says plainly what worked and what
-did not. Safe to run again — it redoes the failed steps.
+did not. Safe to run again - it redoes the failed steps.
 
 Dry run (smoke tests only): WINLINX_INSTALLER_DRYRUN=1 makes every
 step log what it would do without running anything privileged or
 writing anything. The shipped installer always does the real steps.
 """
 
-import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -30,7 +30,35 @@ ICON_PATH = HERE / "icons" / "winlinx-256.png"
 
 DRYRUN_ENV = "WINLINX_INSTALLER_DRYRUN"
 
-from PySide6.QtCore import Qt, QThread, Signal  # noqa: E402
+sys.path.insert(0, str(HERE))
+try:
+    import common as _common
+    __version__ = _common.__version__
+except ImportError:  # pragma: no cover - common.py ships next to this file
+    __version__ = "unknown"
+
+# yabridge, pinned + verified (never "latest", never unchecked).
+# SHA-256 of yabridge-5.1.1.tar.gz, fetched from the GitHub release.
+YABRIDGE_VERSION = "5.1.1"
+YABRIDGE_SHA256 = (
+    "d11f0307412b5566b09a75ed4aa191266db56d22f4de4d20e4fbde6296cd1a47")
+YABRIDGE_URL = ("https://github.com/robbert-vdh/yabridge/releases/"
+                "download/%s/yabridge-%s.tar.gz"
+                % (YABRIDGE_VERSION, YABRIDGE_VERSION))
+# WineHQ apt key fingerprint (no spaces), verified with gpg
+# --show-keys against the downloaded key before it is trusted.
+WINEHQ_KEY_FINGERPRINT = "D43F640145369C51D786DDEA76F1A20FF987672F"
+
+# MIME types the WinLinx runner handles (see desktop/winlinx-mime.xml).
+RUNNER_MIME_TYPES = (
+    "application/x-msdownload",
+    "application/x-msi",
+    "application/x-winlinx-vst3",
+    "application/x-winlinx-vst2",
+    "application/x-winlinx-clap",
+)
+
+from PySide6.QtCore import Qt, QSettings, QThread, Signal  # noqa: E402
 from PySide6.QtGui import QIcon, QPixmap  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
@@ -107,28 +135,50 @@ class InstallContext:
         if self.dryrun:
             return 0
         if not shutil.which("pkexec"):
-            self.log("  !! pkexec not found — cannot run admin steps")
+            self.log("  !! pkexec not found - cannot run admin steps")
             return 127
         return self.run(["pkexec", "bash", "-c", script],
                         timeout=timeout)
 
     # -- network ------------------------------------------------------
 
-    def download(self, url, dest):
-        """Download a URL to a file. Returns True on success.
-        Dry-run pretends success."""
+    def download(self, url, dest, resume=True):
+        """Download a URL to a file, with retries and resume
+        (U24: a failed or frozen download picks up where it left
+        off). Returns True on success. Dry-run pretends success."""
         self.log("  downloading %s" % url)
         if self.dryrun:
             return True
-        try:
-            request = urllib.request.Request(
-                url, headers={"User-Agent": "WinLinx-installer/0.1"})
-            with urllib.request.urlopen(request, timeout=120) as resp:
-                Path(dest).write_bytes(resp.read())
-            return True
-        except Exception as exc:  # noqa: BLE001 - logged, step warns
-            self.log("  !! download failed: %s" % exc)
-            return False
+        dest = Path(dest)
+        for attempt in range(3):
+            try:
+                headers = {"User-Agent": "WinLinx-installer/%s"
+                           % __version__}
+                start = 0
+                if resume and dest.is_file():
+                    start = dest.stat().st_size
+                    if start > 0:
+                        headers["Range"] = "bytes=%d-" % start
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=120) as resp:
+                    if start and resp.status == 206:
+                        mode = "ab"
+                    else:
+                        mode = "wb"
+                        start = 0
+                    with open(dest, mode) as fh:
+                        while True:
+                            chunk = resp.read(1024 * 256)
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                return True
+            except Exception as exc:  # noqa: BLE001 - retried, then logged
+                self.log("  !! download attempt %d failed: %s"
+                         % (attempt + 1, exc))
+                if attempt == 2:
+                    return False
+        return False
 
     # -- filesystem ---------------------------------------------------
 
@@ -219,8 +269,8 @@ def _codename():
 def render_icons_from_svg(svg_path, out_dir):
     """Render winlinx-{256,128,48}.png from the SVG into out_dir.
     Used by the installer when the PNGs are missing (a git clone
-    ships only the SVG — the GitHub snapshot push cannot carry
-    binary files — while the release zip ships the PNGs too).
+    ships only the SVG - the GitHub snapshot push cannot carry
+    binary files - while the release zip ships the PNGs too).
     Returns True on success."""
     try:
         from PySide6.QtCore import Qt
@@ -247,6 +297,49 @@ def render_icons_from_svg(svg_path, out_dir):
         return False
 
 
+# ---------------------------------------------------------------- verification
+
+def verify_sha256(path, expected):
+    """True when the file at path hashes to expected (hex)."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError:
+        return False
+    return digest.hexdigest().lower() == expected.lower()
+
+
+def normalize_fingerprint(text):
+    """A gpg fingerprint with spaces and case removed, for
+    comparison ('D43F 6401 ...' -> 'D43F6401...')."""
+    return "".join((text or "").split()).upper()
+
+
+def verify_winehq_key(ctx, key_path):
+    """Check the downloaded WineHQ key against the known fingerprint
+    with gpg. Returns True only on a match; logs what happened."""
+    if ctx.dryrun:
+        ctx.log("  would verify the WineHQ key fingerprint")
+        return True
+    code, out = ctx.run_output(["gpg", "--show-keys",
+                                "--with-fingerprint", str(key_path)])
+    if code != 0 or not out:
+        ctx.log("WARNING: could not read the WineHQ key with gpg - "
+                "the WineHQ repository will NOT be added")
+        return False
+    if WINEHQ_KEY_FINGERPRINT in normalize_fingerprint(out):
+        ctx.log("OK: WineHQ key fingerprint matches")
+        return True
+    ctx.log("WARNING: the WineHQ key fingerprint does NOT match - "
+            "the WineHQ repository will NOT be added")
+    return False
+
+
 # ---------------------------------------------------------------- the steps
 
 def step_wine(ctx):
@@ -256,6 +349,8 @@ def step_wine(ctx):
     ctx.log("Ubuntu base detected: %s" % codename)
     key_ok = ctx.download("https://dl.winehq.org/wine-builds/winehq.key",
                           "/tmp/winlinx-winehq.key")
+    if key_ok:
+        key_ok = verify_winehq_key(ctx, "/tmp/winlinx-winehq.key")
     src_ok = ctx.download(
         "https://dl.winehq.org/wine-builds/ubuntu/dists/%s/winehq-%s.sources"
         % (codename, codename), "/tmp/winlinx-winehq.sources")
@@ -271,7 +366,7 @@ def step_wine(ctx):
         ctx.log("WineHQ repository files downloaded")
     else:
         ctx.log("WARNING: could not fetch the WineHQ repository files "
-                "(no internet?) — will try the older Wine from Mint")
+                "(no internet?) - will try the older Wine from Mint")
     lines.append("apt-get update || true")
     lines.append("apt-get install --install-recommends -y "
                  "winehq-staging winetricks || apt-get install -y wine")
@@ -282,7 +377,7 @@ def step_wine(ctx):
     if rc == 0 and version:
         ctx.log("OK: Wine installed: %s" % version)
         return StepResult(StepResult.DONE, version)
-    ctx.log("WARNING: Wine could not be installed — Windows programs "
+    ctx.log("WARNING: Wine could not be installed - Windows programs "
             "will NOT run until Wine is installed")
     return StepResult(StepResult.FAIL,
                       "Wine is not installed afterwards")
@@ -305,75 +400,85 @@ def step_clamav(ctx):
         ctx.log("OK: ClamAV installed: %s" % version)
         if code != 0:
             ctx.log("WARNING: signature download or the updater "
-                    "service reported a problem — scans may fail "
+                    "service reported a problem - scans may fail "
                     "until signatures download")
             return StepResult(StepResult.WARN,
                               "signatures may be missing")
         return StepResult(StepResult.DONE, version)
-    ctx.log("WARNING: ClamAV could not be installed — files will run "
+    ctx.log("WARNING: ClamAV could not be installed - files will run "
             "UNSCANNED until it is installed")
     return StepResult(StepResult.FAIL, "ClamAV is not installed")
 
 
 def step_yabridge(ctx):
-    """yabridge (bridges Windows VST plug-ins into Linux)."""
-    ctx.log("Installing yabridge (bridges Windows VST plug-ins)…")
+    """yabridge (bridges Windows VST plug-ins into Linux). Pinned
+    release, SHA-256 verified after download, extracted with a
+    filter (PEP 706)."""
+    ctx.log("Installing yabridge %s (bridges Windows VST plug-ins)…"
+            % YABRIDGE_VERSION)
     if ctx.which("yabridgectl"):
         ctx.log("OK: yabridge already installed")
         return StepResult(StepResult.DONE, "already installed")
     if ctx.dryrun:
-        ctx.log("Dry run: would fetch the latest yabridge release "
-                "from GitHub and install it to ~/.local/share/yabridge")
+        ctx.log("Dry run: would download yabridge %s from GitHub, "
+                "verify its SHA-256 (%s...), and install it to "
+                "~/.local/share/yabridge"
+                % (YABRIDGE_VERSION, YABRIDGE_SHA256[:16]))
         return StepResult(StepResult.DONE, "dry-run")
-    tag = ""
+    archive = "/tmp/winlinx-yabridge.tar.gz"
     try:
-        request = urllib.request.Request(
-            "https://api.github.com/repos/robbert-vdh/yabridge/releases/latest",
-            headers={"User-Agent": "WinLinx-installer/0.1"})
-        with urllib.request.urlopen(request, timeout=60) as resp:
-            tag = json.loads(resp.read().decode("utf-8"))["tag_name"]
-    except Exception as exc:  # noqa: BLE001 - logged, step warns
-        ctx.log("WARNING: could not ask GitHub for the latest "
-                "yabridge release: %s" % exc)
-    if tag and ctx.download(
-            "https://github.com/robbert-vdh/yabridge/releases/download/"
-            "%s/yabridge-%s.tar.gz" % (tag, tag),
-            "/tmp/winlinx-yabridge.tar.gz"):
+        if os.path.exists(archive):
+            os.unlink(archive)
+    except OSError:
+        pass
+    if not ctx.download(YABRIDGE_URL, archive):
+        ctx.log("WARNING: yabridge could not be downloaded (no "
+                "internet?) - VST bridging will NOT work until it is "
+                "installed")
+        return StepResult(StepResult.FAIL, "yabridge not installed")
+    if not verify_sha256(archive, YABRIDGE_SHA256):
+        ctx.log("WARNING: the yabridge download does NOT match its "
+                "SHA-256 checksum - refusing to install it")
         try:
-            import tempfile
-            with tempfile.TemporaryDirectory() as tmpd:
-                with tarfile.open("/tmp/winlinx-yabridge.tar.gz") as tf:
-                    tf.extractall(tmpd)
-                found = None
-                for root, _dirs, files in os.walk(tmpd):
-                    if "yabridgectl" in files:
-                        found = Path(root)
-                        break
-                if found is not None:
-                    dest = ctx.home / ".local" / "share" / "yabridge"
-                    ctx.mkdir(dest)
-                    ctx.copy_tree(found, dest)
-                    ctx.mkdir(ctx.home / ".local" / "bin")
-                    link = ctx.home / ".local" / "bin" / "yabridgectl"
-                    try:
-                        if link.is_symlink() or link.exists():
-                            link.unlink()
-                        os.symlink(str(dest / "yabridgectl"), link)
-                    except OSError as exc:
-                        ctx.log("  !! could not link yabridgectl: %s"
-                                % exc)
-                    ctx.log("OK: yabridge %s installed" % tag)
-                    return StepResult(StepResult.DONE, tag)
-        except Exception as exc:  # noqa: BLE001 - logged, step warns
-            ctx.log("WARNING: yabridge archive problem: %s" % exc)
-        finally:
-            try:
-                os.unlink("/tmp/winlinx-yabridge.tar.gz")
-            except OSError:
-                pass
-    ctx.log("WARNING: yabridge could not be downloaded (no "
-            "internet?) — VST bridging will NOT work until it is "
-            "installed")
+            os.unlink(archive)
+        except OSError:
+            pass
+        return StepResult(StepResult.FAIL, "checksum mismatch")
+    ctx.log("OK: yabridge checksum matches")
+    try:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpd:
+            with tarfile.open(archive) as tf:
+                tf.extractall(tmpd, filter="data")
+            found = None
+            for root, _dirs, files in os.walk(tmpd):
+                if "yabridgectl" in files:
+                    found = Path(root)
+                    break
+            if found is not None:
+                dest = ctx.home / ".local" / "share" / "yabridge"
+                ctx.mkdir(dest)
+                ctx.copy_tree(found, dest)
+                ctx.mkdir(ctx.home / ".local" / "bin")
+                link = ctx.home / ".local" / "bin" / "yabridgectl"
+                try:
+                    if link.is_symlink() or link.exists():
+                        link.unlink()
+                    os.symlink(str(dest / "yabridgectl"), link)
+                except OSError as exc:
+                    ctx.log("  !! could not link yabridgectl: %s"
+                            % exc)
+                ctx.log("OK: yabridge %s installed" % YABRIDGE_VERSION)
+                return StepResult(StepResult.DONE, YABRIDGE_VERSION)
+    except Exception as exc:  # noqa: BLE001 - logged, step warns
+        ctx.log("WARNING: yabridge archive problem: %s" % exc)
+    finally:
+        try:
+            os.unlink(archive)
+        except OSError:
+            pass
+    ctx.log("WARNING: yabridge could not be installed - VST bridging "
+            "will NOT work until it is installed")
     return StepResult(StepResult.FAIL, "yabridge not installed")
 
 
@@ -384,7 +489,7 @@ def step_pyside6(ctx):
     if rc == 0:
         ctx.log("OK: PySide6 already installed")
         return StepResult(StepResult.DONE, "already installed")
-    ctx.log("PySide6 missing for %s — trying pip…" % sys.executable)
+    ctx.log("PySide6 missing for %s - trying pip…" % sys.executable)
     code = ctx.run([sys.executable, "-m", "pip", "install", "--user",
                     "--break-system-packages", "PySide6-Essentials"],
                    timeout=600)
@@ -392,7 +497,7 @@ def step_pyside6(ctx):
     if code == 0 and rc == 0:
         ctx.log("OK: PySide6 installed (pip)")
         return StepResult(StepResult.DONE, "installed via pip")
-    ctx.log("WARNING: PySide6 could not be installed — the Program "
+    ctx.log("WARNING: PySide6 could not be installed - the Program "
             "Manager window will NOT open until it is installed")
     return StepResult(StepResult.FAIL, "PySide6 missing")
 
@@ -407,10 +512,10 @@ def step_prefix(ctx):
             ctx.log("OK: Wine prefix ready at %s"
                     % (ctx.home / ".wine"))
         else:
-            ctx.log("WARNING: wineboot was slow or failed — the "
+            ctx.log("WARNING: wineboot was slow or failed - the "
                     "prefix may still work")
     else:
-        ctx.log("WARNING: wineboot not found — skipping prefix setup")
+        ctx.log("WARNING: wineboot not found - skipping prefix setup")
     vst_dirs = [
         ctx.home / ".wine" / "drive_c" / "Program Files"
         / "Common Files" / "VST3",
@@ -433,10 +538,10 @@ def step_prefix(ctx):
         if code == 0:
             ctx.log("OK: Plug-in folders registered with yabridge")
         else:
-            ctx.log("WARNING: yabridgectl sync reported a problem — "
+            ctx.log("WARNING: yabridgectl sync reported a problem - "
                     "bridging may still work; use Re-sync in WinLinx")
     else:
-        ctx.log("WARNING: yabridgectl not found — skipping plug-in "
+        ctx.log("WARNING: yabridgectl not found - skipping plug-in "
                 "folder setup")
     return StepResult(StepResult.DONE)
 
@@ -447,7 +552,11 @@ def step_files(ctx):
     dest = ctx.home / ".local" / "share" / "winlinx"
     ctx.mkdir(dest)
     ok = True
-    for name in ("common.py", "manager.py", "scanner.py", "watcher.py"):
+    # Same module list as install.sh (cp winlinx/*.py): every module
+    # in the winlinx folder ships, so the two install paths cannot
+    # drift apart.
+    for name in ("__init__.py", "common.py", "installer.py",
+                 "manager.py", "scanner.py", "watcher.py"):
         ok = ctx.copy(SRC_DIR / "winlinx" / name, dest / name) and ok
     ok = ctx.copy(SRC_DIR / "winlinx" / "run-windows-file",
                   dest / "run-windows-file") and ok
@@ -461,7 +570,7 @@ def step_files(ctx):
                 ctx.log("OK: App icons rendered from winlinx.svg")
             else:
                 ctx.log("WARNING: could not render app icons from "
-                        "the SVG — the menu entry will show a "
+                        "the SVG - the menu entry will show a "
                         "generic icon")
     ctx.mkdir(dest / "quarantine")
 
@@ -478,15 +587,26 @@ def step_files(ctx):
             continue
         ok = ctx.write_text(apps_dir / name,
                             text.replace("@HOME@", home)) and ok
+    # Plug-in file types (.vst3 / .dll / .clap) have no standard MIME
+    # type, so WinLinx defines its own and registers the runner for
+    # them - double-clicking a plug-in bridges it, like the README
+    # promises.
+    mime_dir = ctx.home / ".local" / "share" / "mime" / "packages"
+    ctx.mkdir(mime_dir)
+    ok = ctx.copy(SRC_DIR / "desktop" / "winlinx-mime.xml",
+                  mime_dir / "winlinx.xml") and ok
+    if ctx.which("update-mime-database"):
+        ctx.run(["update-mime-database",
+                 str(ctx.home / ".local" / "share" / "mime")])
     if ctx.which("xdg-mime"):
-        ctx.run(["xdg-mime", "default", "winlinx-runner.desktop",
-                 "application/x-msdownload"])
-        ctx.run(["xdg-mime", "default", "winlinx-runner.desktop",
-                 "application/x-msi"])
+        for mime in RUNNER_MIME_TYPES:
+            ctx.run(["xdg-mime", "default", "winlinx-runner.desktop",
+                     mime])
         ctx.log("OK: Double-clicking .exe/.msi files now runs them "
-                "(scanned first)")
+                "(scanned first), and double-clicking .vst3/.dll/"
+                ".clap plug-ins bridges them")
     else:
-        ctx.log("WARNING: xdg-mime not found — double-click may not "
+        ctx.log("WARNING: xdg-mime not found - double-click may not "
                 "work; use the watched folders instead")
 
     ctx.mkdir(ctx.home / "WinLinx" / "Programs")
@@ -512,12 +632,12 @@ def step_files(ctx):
 
 
 STEPS = [
-    ("wine", "Wine — runs Windows programs", step_wine),
-    ("clamav", "ClamAV + virus signatures — scans files first",
+    ("wine", "Wine - runs Windows programs", step_wine),
+    ("clamav", "ClamAV + virus signatures - scans files first",
      step_clamav),
-    ("yabridge", "yabridge — bridges Windows VST plug-ins",
+    ("yabridge", "yabridge - bridges Windows VST plug-ins",
      step_yabridge),
-    ("pyside6", "PySide6 — the Program Manager window", step_pyside6),
+    ("pyside6", "PySide6 - the Program Manager window", step_pyside6),
     ("prefix", "Wine prefix + VST folders", step_prefix),
     ("files", "WinLinx files, menu entry + watcher", step_files),
 ]
@@ -547,7 +667,7 @@ class InstallWorker(QThread):
         total = len(STEPS)
         for index, (_key, title, func) in enumerate(STEPS):
             if ctx.cancelled:
-                ctx.log("Cancelled — stopping after %d of %d steps"
+                ctx.log("Cancelled - stopping after %d of %d steps"
                         % (index, total))
                 break
             self.step_status.emit(index, "running…")
@@ -585,6 +705,10 @@ class InstallerWindow(QMainWindow):
         self._installing = False
         self.setWindowTitle("Install WinLinx")
         self.resize(720, 560)
+        self._settings = QSettings("BrokeNBored", "WinLinxInstaller")
+        saved = self._settings.value("geometry")
+        if saved is not None:
+            self.restoreGeometry(saved)
         if ICON_PATH.is_file():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
 
@@ -599,11 +723,11 @@ class InstallerWindow(QMainWindow):
                 Qt.TransformationMode.SmoothTransformation))
             header.addWidget(icon_label)
         title = QLabel(
-            "<b>Install WinLinx</b><br>"
-            "Windows programs and VST plug-ins, just working on Linux "
-            "— no manual setup per file, ever.<br>"
+            "<b>Install WinLinx %s</b><br>"
+            "Windows programs and VST plug-ins, just working on Linux, "
+            "no manual setup per file, ever.<br>"
             "This takes a few minutes and will ask for your password "
-            "when a step needs it. Safe to run again.")
+            "when a step needs it. Safe to run again." % __version__)
         title.setWordWrap(True)
         header.addWidget(title, 1)
         layout.addLayout(header)
@@ -611,7 +735,7 @@ class InstallerWindow(QMainWindow):
         self.steps_list = QListWidget()
         self.steps_list.setMaximumHeight(170)
         for _key, title_text, _func in STEPS:
-            item = QListWidgetItem("%s  —  pending" % title_text)
+            item = QListWidgetItem("%s - pending" % title_text)
             self.steps_list.addItem(item)
         layout.addWidget(self.steps_list)
 
@@ -642,11 +766,11 @@ class InstallerWindow(QMainWindow):
         layout.addLayout(row)
 
         self.setCentralWidget(root)
-        self.statusBar().showMessage("Ready — press Install when "
+        self.statusBar().showMessage("Ready - press Install when "
                                      "you are ready.")
         self._log("WinLinx installer. Press Install to begin.")
         if dryrun:
-            self._log("DRY RUN — nothing will be installed or changed.")
+            self._log("DRY RUN - nothing will be installed or changed.")
 
     # -- logging ------------------------------------------------------
 
@@ -669,7 +793,7 @@ class InstallerWindow(QMainWindow):
         self.progress_bar.setValue(0)
         for index in range(self.steps_list.count()):
             _key, title, _func = STEPS[index]
-            self.steps_list.item(index).setText("%s  —  pending"
+            self.steps_list.item(index).setText("%s - pending"
                                                % title)
         self.statusBar().showMessage("Installing…")
         self._worker = InstallWorker(dryrun=self._dryrun, parent=self)
@@ -689,7 +813,7 @@ class InstallerWindow(QMainWindow):
     def _on_step_status(self, index, status):
         _key, title, _func = STEPS[index]
         label = STATUS_LABEL.get(status, status)
-        self.steps_list.item(index).setText("%s  —  %s" % (title, label))
+        self.steps_list.item(index).setText("%s - %s" % (title, label))
 
     def _on_finished(self, results):
         self._installing = False
@@ -704,7 +828,7 @@ class InstallerWindow(QMainWindow):
         if not failed:
             if warned:
                 self.statusBar().showMessage(
-                    "Installed with %d warning(s) — see the log"
+                    "Installed with %d warning(s) - see the log"
                     % len(warned))
             else:
                 self.statusBar().showMessage("Installed!")
@@ -712,16 +836,16 @@ class InstallerWindow(QMainWindow):
             self._log("")
             self._log("Done! Drop Windows programs into "
                       "~/WinLinx/Programs and VST plug-ins into "
-                      "~/WinLinx/Plugins — or just double-click any "
+                      "~/WinLinx/Plugins - or just double-click any "
                       ".exe/.msi anywhere.")
             self._log("WinLinx Program Manager is in your app menu.")
         else:
             self.statusBar().showMessage(
-                "Finished with %d failed step(s) — see the log"
+                "Finished with %d failed step(s) - see the log"
                 % len(failed))
             self._log("")
             self._log("Some steps failed. You can press Install again "
-                      "— it redoes the failed steps and leaves the "
+                      "- it redoes the failed steps and leaves the "
                       "rest alone.")
             manager = (Path(os.path.expanduser("~")) / ".local"
                        / "share" / "winlinx" / "manager.py")
@@ -736,7 +860,7 @@ class InstallerWindow(QMainWindow):
         if not manager.is_file():
             QMessageBox.warning(
                 self, "WinLinx is not installed yet",
-                "The Program Manager was not found — the install may "
+                "The Program Manager was not found - the install may "
                 "not have finished. Press Install and try again.")
             return
         try:
@@ -755,15 +879,20 @@ class InstallerWindow(QMainWindow):
     def closeEvent(self, event):
         if self._installing:
             self.statusBar().showMessage(
-                "Install in progress — press Cancel to stop after "
+                "Install in progress - press Cancel to stop after "
                 "the current step.")
             event.ignore()
             return
+        self._settings.setValue("geometry", self.saveGeometry())
         event.accept()
 
 
 def main(argv=None):
-    app = QApplication(sys.argv if argv is None else argv)
+    args = sys.argv if argv is None else argv
+    if "--version" in args or "-V" in args:
+        print("WinLinx installer %s" % __version__)
+        return 0
+    app = QApplication(args)
     dryrun = bool(os.environ.get(DRYRUN_ENV))
     window = InstallerWindow(dryrun=dryrun)
     window.show()

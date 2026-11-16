@@ -7,18 +7,24 @@ no inotify dependency) and makes dropped files Just Work:
   Programs folder:  .exe / .msi  -> scanned, then run with Wine
   Plugins folder:   .exe / .msi  -> scanned, installed with Wine,
                                    then yabridgectl sync
-                    .vst3 / .dll -> scanned, copied to the matching
-                                   Wine VST folder, then sync
+                    .vst3 / .dll / .clap -> scanned, copied to the
+                                   matching Wine VST folder,
+                                   then sync
   Dropped folders:  scanned; a .vst3 bundle in Plugins is bridged,
                     anything else is left in place with a log note.
 
 Nothing runs before it is scanned. A flagged file is moved to
-quarantine instead — it is never installed or executed. The user
+quarantine instead - it is never installed or executed. The user
 decides its fate in the Program Manager (Allow / Delete).
 
 If ClamAV is missing or a scan errors, the file still goes through but
 the log says so in plain words (warn-never-refuse: a missing scanner
 must not brick WinLinx).
+
+A file that fails (no Wine, a copy error, a failed sync) is recorded
+as failed with the real reason - never as handled - and retried on
+later passes with backoff. Failed drops show in the Program Manager
+with a Retry button.
 
 State lives in ~/.local/share/winlinx/handled.json so a file is
 never handled twice; logs go to layer.log in the same folder.
@@ -43,22 +49,18 @@ import scanner
 POLL_SECONDS = 5
 INSTALLER_TIMEOUT = 1800  # 30 min; installers are GUI apps, be patient
 PROGRAM_EXTS = {".exe", ".msi"}
-PLUGIN_EXTS = {".exe", ".msi", ".vst3", ".dll"}
+PLUGIN_EXTS = {".exe", ".msi", ".vst3", ".dll", ".clap"}
+# Retry backoff for failed items, in seconds (attempt 1, 2, 3, 4+).
+RETRY_BACKOFF = (60, 300, 1800, 3600)
 
 
 # ---------------------------------------------------------------- logging
 
 def log(message):
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = "[%s] %s" % (stamp, message)
+    # common.append_log writes the rotating log and feeds the ring
+    # buffer; stdout goes to the systemd journal.
+    line = common.append_log(message)
     print(line, flush=True)
-    try:
-        path = common.log_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------- handled state
@@ -83,11 +85,57 @@ def _save_state(state):
 
 def clear_handled(path):
     """Forget a path so the watcher will handle it again (used after
-    the user Allows a quarantined item back)."""
+    the user Allows a quarantined item back, or presses Retry on a
+    failed drop)."""
     state = _load_state()
     if str(path) in state:
         del state[str(path)]
         _save_state(state)
+
+
+def ignore_path(path):
+    """Mark a path ignored: the watcher will not handle it again
+    unless the file changes. Used by the Failed Drops view."""
+    state = _load_state()
+    key = str(path)
+    record = state.get(key) or {}
+    try:
+        st = Path(path).stat()
+        record["size"] = st.st_size
+        record["mtime"] = st.st_mtime_ns
+    except OSError:
+        pass
+    record["action"] = "ignored"
+    record["time"] = datetime.now().isoformat(timespec="seconds")
+    state[key] = record
+    _save_state(state)
+
+
+def load_failed():
+    """Failed drops, newest first: [{path, name, reason, attempts,
+    time, next_retry}]. The manager's Failed Drops tab reads this."""
+    state = _load_state()
+    out = []
+    for key, record in state.items():
+        if not isinstance(record, dict):
+            continue
+        if record.get("action") != "failed":
+            continue
+        out.append({
+            "path": key,
+            "name": Path(key).name,
+            "reason": record.get("reason", "unknown error"),
+            "attempts": record.get("attempts", 1),
+            "time": record.get("time", ""),
+            "next_retry": record.get("next_retry", 0),
+        })
+    out.sort(key=lambda e: e["time"], reverse=True)
+    return out
+
+
+def _backoff_seconds(attempts):
+    index = min(max(attempts - 1, 0), len(RETRY_BACKOFF) - 1)
+    return RETRY_BACKOFF[index]
 
 
 # ---------------------------------------------------------------- execution
@@ -95,18 +143,18 @@ def clear_handled(path):
 class Executor:
     """Runs external commands. A tiny seam so tests can stub it."""
 
-    def run_detached(self, cmd):
+    def run_detached(self, cmd, env=None):
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL,
                                 stdin=subprocess.DEVNULL,
-                                start_new_session=True)
+                                env=env, start_new_session=True)
 
-    def run_wait(self, cmd, timeout=None):
+    def run_wait(self, cmd, timeout=None, env=None):
         try:
             proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL,
                                   stdin=subprocess.DEVNULL,
-                                  timeout=timeout)
+                                  env=env, timeout=timeout)
             return proc.returncode
         except subprocess.TimeoutExpired:
             return None
@@ -176,12 +224,23 @@ class Watcher:
         record = self._handled.get(key)
         if (record and record.get("size") == fingerprint[0]
                 and record.get("mtime") == fingerprint[1]):
-            return  # already handled, unchanged
+            if record.get("action") == "failed":
+                if time.time() < record.get("next_retry", 0):
+                    return  # not time to retry yet
+                # Retry time: the file is unchanged, so it is stable
+                # by definition - skip the stability gate.
+                self._dispatch(path, kind, is_dir, fingerprint)
+                return
+            return  # already handled (or ignored), unchanged
         if self._seen.get(key) != fingerprint:
             # First sighting, or still changing (copy in progress).
             # Wait until it is stable across two polls.
             self._seen[key] = fingerprint
             return
+        self._dispatch(path, kind, is_dir, fingerprint)
+
+    def _dispatch(self, path, kind, is_dir, fingerprint):
+        key = str(path)
         with self._lock:
             if key in self._busy:
                 return
@@ -204,6 +263,8 @@ class Watcher:
 
     def _mark_handled(self, path, fingerprint, action):
         with self._lock:
+            old = self._handled.get(str(path)) or {}
+            was_failed = old.get("action") == "failed"
             self._handled[str(path)] = {
                 "size": fingerprint[0],
                 "mtime": fingerprint[1],
@@ -211,6 +272,32 @@ class Watcher:
                 "time": datetime.now().isoformat(timespec="seconds"),
             }
             _save_state(self._handled)
+        if was_failed:
+            # It works now after failing before: say so, once.
+            common.notify("WinLinx", "%s is working now."
+                          % path.name)
+
+    def _mark_failed(self, path, fingerprint, reason):
+        """Record the real outcome: failed, with the reason, an
+        attempt count, and the next retry time. Never recorded as
+        handled."""
+        with self._lock:
+            old = self._handled.get(str(path)) or {}
+            attempts = int(old.get("attempts", 0)) + 1
+            self._handled[str(path)] = {
+                "size": fingerprint[0],
+                "mtime": fingerprint[1],
+                "action": "failed",
+                "reason": reason,
+                "attempts": attempts,
+                "next_retry": time.time() + _backoff_seconds(attempts),
+                "time": datetime.now().isoformat(timespec="seconds"),
+            }
+            _save_state(self._handled)
+        if attempts == 1:
+            common.notify("WinLinx",
+                          "%s could not be handled: %s"
+                          % (path.name, reason))
 
     def _handle(self, path, kind, is_dir, fingerprint):
         # 1. Scan gate: nothing runs before it is scanned.
@@ -226,16 +313,28 @@ class Watcher:
                 log("QUARANTINED %s: %s" % (path.name, ", ".join(names)))
                 scanner.quarantine_item(path, result["threats"])
                 self._mark_handled(path, fingerprint, "quarantined")
+                common.notify(
+                    "WinLinx",
+                    "%s was quarantined and did not run: %s"
+                    % (path.name, ", ".join(names)))
                 return
             else:
                 log("Scan clean: %s" % path.name)
 
-        # 2. Normal handling.
+        # 2. Normal handling. Helpers report (ok, reason); a failure
+        # is recorded as failed, never as handled.
         if is_dir:
             if (kind == "plugin"
                     and path.name.lower().endswith(".vst3")):
-                self._copy_plugin_dir(path, common.vst3_dir())
-                self._sync()
+                ok, reason = self._copy_plugin_dir(path,
+                                                   common.vst3_dir())
+                if not ok:
+                    self._mark_failed(path, fingerprint, reason)
+                    return
+                ok, reason = self._sync()
+                if not ok:
+                    self._mark_failed(path, fingerprint, reason)
+                    return
                 self._mark_handled(path, fingerprint, "bridged-vst3-dir")
             else:
                 log("Folder scanned clean, left in place: %s "
@@ -246,50 +345,87 @@ class Watcher:
 
         ext = path.suffix.lower()
         if kind == "program":
-            self._run_program(path)
-            self._mark_handled(path, fingerprint, "ran")
+            ok, reason = self._run_program(path)
+            if ok:
+                self._mark_handled(path, fingerprint, "ran")
+            else:
+                self._mark_failed(path, fingerprint, reason)
             return
         if ext in (".exe", ".msi"):
-            self._run_installer_then_sync(path)
-            self._mark_handled(path, fingerprint, "installed+synced")
+            ok, reason = self._run_installer_then_sync(path)
+            if ok:
+                self._mark_handled(path, fingerprint, "installed+synced")
+            elif reason == "sync failed":
+                # The installer itself ran: do not re-run it on retry.
+                # The plug-in folders can be re-synced from the
+                # manager instead.
+                self._mark_handled(path, fingerprint, "installed")
+            else:
+                self._mark_failed(path, fingerprint, reason)
         elif ext == ".vst3":
-            self._copy_plugin(path, common.vst3_dir())
-            self._sync()
-            self._mark_handled(path, fingerprint, "bridged-vst3")
+            self._handle_plugin_file(path, fingerprint,
+                                     common.vst3_dir(), "bridged-vst3")
         elif ext == ".dll":
-            self._copy_plugin(path, common.vst2_dir())
-            self._sync()
-            self._mark_handled(path, fingerprint, "bridged-vst2")
+            self._handle_plugin_file(path, fingerprint,
+                                     common.vst2_dir(), "bridged-vst2")
+        elif ext == ".clap":
+            self._handle_plugin_file(path, fingerprint,
+                                     common.vst3_dir(), "bridged-clap")
+
+    def _handle_plugin_file(self, path, fingerprint, dest_dir, action):
+        ok, reason = self._copy_plugin(path, dest_dir)
+        if not ok:
+            self._mark_failed(path, fingerprint, reason)
+            return
+        ok, reason = self._sync()
+        if not ok:
+            # Re-copying is harmless, so a sync failure is retryable.
+            self._mark_failed(path, fingerprint, reason)
+            return
+        self._mark_handled(path, fingerprint, action)
 
     def _run_program(self, path):
         if not common.find_wine():
-            log("WARNING: Wine is not installed, cannot run %s" % path.name)
-            return
+            reason = "Wine is not installed"
+            log("WARNING: Wine is not installed, cannot run %s"
+                % path.name)
+            return False, reason
         log("Running: %s" % path.name)
-        self.executor.run_detached(["wine", str(path)])
+        try:
+            self.executor.run_detached(
+                ["wine", str(path)], env=common.launch_env(str(path)))
+        except OSError as exc:
+            return False, str(exc)
+        return True, ""
 
     def _run_installer_then_sync(self, path):
         if not common.find_wine():
+            reason = "Wine is not installed"
             log("WARNING: Wine is not installed, cannot install %s"
                 % path.name)
-            return
+            return False, reason
         log("Installing: %s (this can take a while)" % path.name)
         code = self.executor.run_wait(["wine", str(path)],
                                       timeout=INSTALLER_TIMEOUT)
         if code is None:
-            log("WARNING: installer %s timed out, syncing anyway"
-                % path.name)
-        else:
-            log("Installer finished: %s (exit %s)" % (path.name, code))
-        self._sync()
+            log("WARNING: installer %s timed out" % path.name)
+            return False, "installer timed out"
+        log("Installer finished: %s (exit %s)" % (path.name, code))
+        ok, _reason = self._sync()
+        if not ok:
+            return False, "sync failed"
+        return True, ""
 
     def _copy_plugin(self, path, dest_dir):
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(path), str(dest_dir / path.name))
             log("Copied %s to %s" % (path.name, dest_dir))
+            return True, ""
         except OSError as exc:
+            reason = "copy failed: %s" % exc
             log("ERROR copying %s: %s" % (path.name, exc))
+            return False, reason
 
     def _copy_plugin_dir(self, path, dest_dir):
         try:
@@ -299,15 +435,20 @@ class Watcher:
                 shutil.rmtree(target)
             shutil.copytree(str(path), str(target))
             log("Copied %s to %s" % (path.name, dest_dir))
+            return True, ""
         except OSError as exc:
+            reason = "copy failed: %s" % exc
             log("ERROR copying %s: %s" % (path.name, exc))
+            return False, reason
 
     def _sync(self):
         ok, message = self.executor.sync_bridges()
         if ok:
             log("Bridges re-synced")
-        else:
-            log("WARNING: bridge sync failed (%s)" % message)
+            return True, ""
+        reason = "bridge sync failed (%s)" % message
+        log("WARNING: %s" % reason)
+        return False, reason
 
 
 # ---------------------------------------------------------------- main
@@ -322,7 +463,16 @@ def main(argv=None):
     parser.add_argument("--interval", type=int, default=POLL_SECONDS,
                         help="poll interval in seconds (default %d)"
                         % POLL_SECONDS)
+    parser.add_argument("--version", action="version",
+                        version="WinLinx watcher %s"
+                        % common.__version__)
+    parser.add_argument("--prefix-for", metavar="EXE",
+                        help="print the per-program prefix path for "
+                        "an .exe name (empty = shared prefix) and exit")
     args = parser.parse_args(argv)
+    if args.prefix_for:
+        print(common.prefix_for_exe(args.prefix_for) or "")
+        return 0
     if args.rescan:
         try:
             common.state_path().unlink()

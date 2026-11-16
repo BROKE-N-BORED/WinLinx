@@ -1,5 +1,5 @@
 #!/bin/bash
-# WinLinx v0.1 — installer for Linux Mint 22.x (terminal fallback)
+# WinLinx - installer for Linux Mint 22.x (terminal fallback)
 #
 # Normal install: unzip the folder and double-click "Install WinLinx".
 # This script does the same steps from a terminal, for when the
@@ -18,30 +18,58 @@
 #
 # It never fails silently: every step prints what happened, and a
 # failed step prints a warning and moves on (warn-never-refuse).
-# Safe to run again — it will just redo the steps.
+# Safe to run again - it will just redo the steps.
 
 set -u
 cd "$(dirname "$0")"
+
+# The version lives in winlinx/common.py (__version__) - read it
+# from there so there is exactly one place to bump.
+VERSION="$(sed -n 's/^__version__ *= *"\(.*\)".*/\1/p' winlinx/common.py 2>/dev/null | head -1)"
+VERSION="${VERSION:-unknown}"
+
+if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
+    echo "WinLinx installer $VERSION"
+    exit 0
+fi
+
+# yabridge, pinned + verified (never "latest", never unchecked).
+YABRIDGE_VERSION="5.1.1"
+YABRIDGE_SHA256="d11f0307412b5566b09a75ed4aa191266db56d22f4de4d20e4fbde6296cd1a47"
+# WineHQ apt key fingerprint (no spaces), verified with gpg before
+# the key is trusted.
+WINEHQ_KEY_FINGERPRINT="D43F640145369C51D786DDEA76F1A20FF987672F"
 
 say()  { echo ""; echo "==> $1"; }
 warn() { echo ""; echo "!!  WARNING: $1"; }
 ok()   { echo "    OK: $1"; }
 
-echo "WinLinx v0.1 — installer"
+echo "WinLinx $VERSION - installer"
 echo "This takes a few minutes and will ask for your password (sudo)."
 
 # ---------------------------------------------------------------- helpers
 
 # Download a URL to a file: curl first, wget as backup.
+# Retries 3 times, resuming a partial download when it can.
 download() {
     url="$1"; out="$2"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL -o "$out" "$url" 2>/dev/null
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$out" "$url" 2>/dev/null
-    else
-        return 1
-    fi
+    i=1
+    while [ "$i" -le 3 ]; do
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fsSL -C - --retry 3 -o "$out" "$url" 2>/dev/null; then
+                return 0
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if wget -q -c -O "$out" "$url" 2>/dev/null; then
+                return 0
+            fi
+        else
+            return 1
+        fi
+        i=$((i + 1))
+        sleep 2
+    done
+    return 1
 }
 
 # ---------------------------------------------------------------- 1. Wine
@@ -53,22 +81,34 @@ sudo dpkg --add-architecture i386 2>/dev/null \
 CODENAME="$(. /etc/os-release 2>/dev/null; echo "${UBUNTU_CODENAME:-noble}")"
 echo "    Ubuntu base detected: $CODENAME"
 sudo mkdir -pm755 /etc/apt/keyrings 2>/dev/null || true
-if download "https://dl.winehq.org/wine-builds/winehq.key" /tmp/winehq.key \
+KEY_OK=0
+if download "https://dl.winehq.org/wine-builds/winehq.key" /tmp/winehq.key; then
+    # Trust the key only when its fingerprint matches the known one.
+    if command -v gpg >/dev/null 2>&1 \
+       && gpg --show-keys --with-fingerprint /tmp/winehq.key 2>/dev/null \
+          | tr -d ' \n' | grep -q "$WINEHQ_KEY_FINGERPRINT"; then
+        ok "WineHQ key fingerprint matches"
+        KEY_OK=1
+    else
+        warn "the WineHQ key fingerprint does NOT match (or gpg is missing) - the WineHQ repository will NOT be added"
+    fi
+fi
+if [ "$KEY_OK" = "1" ] \
    && sudo cp /tmp/winehq.key /etc/apt/keyrings/winehq-archive.key 2>/dev/null \
    && download "https://dl.winehq.org/wine-builds/ubuntu/dists/$CODENAME/winehq-$CODENAME.sources" /tmp/winehq.sources \
    && sudo cp /tmp/winehq.sources "/etc/apt/sources.list.d/winehq-$CODENAME.sources" 2>/dev/null; then
     ok "WineHQ repository added"
 else
-    warn "could not add the WineHQ repository (no internet?) — will try the older Wine from Mint instead"
+    warn "could not add the WineHQ repository - will try the older Wine from Mint instead"
 fi
-sudo apt update 2>/dev/null || warn "apt update had errors — continuing anyway"
+sudo apt update 2>/dev/null || warn "apt update had errors - continuing anyway"
 if sudo apt install --install-recommends -y winehq-staging winetricks 2>/dev/null; then
     ok "Wine Staging installed: $(wine --version 2>/dev/null)"
 elif sudo apt install -y wine 2>/dev/null; then
-    warn "Wine Staging was not available, installed the older Wine from Mint instead — most programs still work, but yabridge prefers Staging"
+    warn "Wine Staging was not available, installed the older Wine from Mint instead - most programs still work, but yabridge prefers Staging"
     ok "Wine installed: $(wine --version 2>/dev/null)"
 else
-    warn "Wine could not be installed — Windows programs will NOT run until Wine is installed"
+    warn "Wine could not be installed - Windows programs will NOT run until Wine is installed"
 fi
 
 # ---------------------------------------------------------------- 2. ClamAV
@@ -77,7 +117,7 @@ say "Step 2 of 7: installing ClamAV (scans files before they run)"
 if sudo apt install -y clamav clamav-freshclam 2>/dev/null; then
     ok "ClamAV installed"
 else
-    warn "ClamAV could not be installed — files will run UNSCANNED until you install it (sudo apt install clamav clamav-freshclam)"
+    warn "ClamAV could not be installed - files will run UNSCANNED until you install it (sudo apt install clamav clamav-freshclam)"
 fi
 if command -v freshclam >/dev/null 2>&1; then
     echo "    Downloading virus signatures (big download, a few minutes)…"
@@ -85,7 +125,7 @@ if command -v freshclam >/dev/null 2>&1; then
     if sudo freshclam 2>/dev/null; then
         ok "Virus signatures downloaded: $(clamscan --version 2>/dev/null)"
     else
-        warn "signature download failed (no internet?) — scans will fail until signatures download; run: sudo freshclam"
+        warn "signature download failed (no internet?) - scans will fail until signatures download; run: sudo freshclam"
     fi
     sudo systemctl enable --now clamav-freshclam 2>/dev/null \
         && ok "Automatic daily signature updates enabled" \
@@ -94,35 +134,38 @@ fi
 
 # ---------------------------------------------------------------- 3. yabridge
 
-say "Step 3 of 7: installing yabridge (bridges Windows VST plug-ins)"
+say "Step 3 of 7: installing yabridge $YABRIDGE_VERSION (bridges Windows VST plug-ins)"
 YABRIDGE_OK=0
 if command -v yabridgectl >/dev/null 2>&1; then
     ok "yabridge already installed"
     YABRIDGE_OK=1
 else
-    TAG=""
-    if command -v curl >/dev/null 2>&1; then
-        TAG="$(curl -fsSL https://api.github.com/repos/robbert-vdh/yabridge/releases/latest 2>/dev/null \
-            | grep '"tag_name":' | head -1 | sed 's/.*"tag_name": *"//; s/".*//')"
-    fi
-    if [ -n "$TAG" ] \
-       && download "https://github.com/robbert-vdh/yabridge/releases/download/$TAG/yabridge-$TAG.tar.gz" /tmp/yabridge.tar.gz; then
-        TMPD="$(mktemp -d)"
-        if tar -xzf /tmp/yabridge.tar.gz -C "$TMPD" 2>/dev/null; then
-            YBDIR="$(find "$TMPD" -maxdepth 2 -name yabridgectl -printf '%h\n' 2>/dev/null | head -1)"
-            if [ -n "$YBDIR" ] && [ -x "$YBDIR/yabridgectl" ]; then
-                mkdir -p "$HOME/.local/share/yabridge"
-                cp -r "$YBDIR"/. "$HOME/.local/share/yabridge/"
-                mkdir -p "$HOME/.local/bin"
-                ln -sf "$HOME/.local/share/yabridge/yabridgectl" "$HOME/.local/bin/yabridgectl"
-                ok "yabridge $TAG installed"
-                YABRIDGE_OK=1
+    rm -f /tmp/yabridge.tar.gz 2>/dev/null
+    if download "https://github.com/robbert-vdh/yabridge/releases/download/$YABRIDGE_VERSION/yabridge-$YABRIDGE_VERSION.tar.gz" /tmp/yabridge.tar.gz; then
+        # Verify the checksum before extracting anything.
+        GOT="$(sha256sum /tmp/yabridge.tar.gz 2>/dev/null | cut -d' ' -f1)"
+        if [ "$GOT" = "$YABRIDGE_SHA256" ]; then
+            ok "yabridge checksum matches"
+            TMPD="$(mktemp -d)"
+            if tar -xzf /tmp/yabridge.tar.gz -C "$TMPD" 2>/dev/null; then
+                YBDIR="$(find "$TMPD" -maxdepth 2 -name yabridgectl -printf '%h\n' 2>/dev/null | head -1)"
+                if [ -n "$YBDIR" ] && [ -x "$YBDIR/yabridgectl" ]; then
+                    mkdir -p "$HOME/.local/share/yabridge"
+                    cp -r "$YBDIR"/. "$HOME/.local/share/yabridge/"
+                    mkdir -p "$HOME/.local/bin"
+                    ln -sf "$HOME/.local/share/yabridge/yabridgectl" "$HOME/.local/bin/yabridgectl"
+                    ok "yabridge $YABRIDGE_VERSION installed"
+                    YABRIDGE_OK=1
+                fi
             fi
+            rm -rf "$TMPD"
+        else
+            warn "the yabridge download does NOT match its SHA-256 checksum - refusing to install it"
         fi
-        rm -rf "$TMPD" /tmp/yabridge.tar.gz
+        rm -f /tmp/yabridge.tar.gz
     fi
     if [ "$YABRIDGE_OK" = "0" ]; then
-        warn "yabridge could not be downloaded (no internet?) — VST bridging will NOT work until yabridge is installed"
+        warn "yabridge could not be installed - VST bridging will NOT work until yabridge is installed"
     fi
 fi
 
@@ -142,7 +185,7 @@ else
        && python3 -c "import PySide6" 2>/dev/null; then
         ok "PySide6 installed (pip)"
     else
-        warn "PySide6 could not be installed — the Program Manager window will NOT open until it is installed"
+        warn "PySide6 could not be installed - the Program Manager window will NOT open until it is installed"
     fi
 fi
 
@@ -154,10 +197,10 @@ if command -v wineboot >/dev/null 2>&1; then
     if timeout 300 wineboot --init 2>/dev/null; then
         ok "Wine prefix ready at $HOME/.wine"
     else
-        warn "wineboot was slow or failed — the prefix may still work; try running a Windows program and see"
+        warn "wineboot was slow or failed - the prefix may still work; try running a Windows program and see"
     fi
 else
-    warn "wineboot not found — skipping prefix setup"
+    warn "wineboot not found - skipping prefix setup"
 fi
 
 mkdir -p "$HOME/.wine/drive_c/Program Files/Common Files/VST3"
@@ -177,10 +220,10 @@ if [ -n "$YABRIDGECTL" ]; then
     if "$YABRIDGECTL" sync 2>/dev/null; then
         ok "Plug-in folders registered with yabridge"
     else
-        warn "yabridgectl sync reported a problem — bridging may still work; use Re-sync in the Program Manager"
+        warn "yabridgectl sync reported a problem - bridging may still work; use Re-sync in the Program Manager"
     fi
 else
-    warn "yabridgectl not found — skipping plug-in folder setup"
+    warn "yabridgectl not found - skipping plug-in folder setup"
 fi
 
 # ---------------------------------------------------------------- 6. Install the WinLinx files
@@ -194,6 +237,19 @@ chmod +x "$DEST/run-windows-file" 2>/dev/null || true
 mkdir -p "$DEST/icons"
 cp winlinx/icons/* "$DEST/icons/" 2>/dev/null \
     || warn "could not copy the icons"
+# From a clone there is only the SVG: render the PNGs from it when
+# they are missing (same as the GUI installer does).
+if [ -f "$DEST/icons/winlinx.svg" ] \
+   && [ ! -f "$DEST/icons/winlinx-256.png" ] \
+   && [ -f render_icon.py ] \
+   && python3 -c "import PySide6" 2>/dev/null; then
+    if QT_QPA_PLATFORM=offscreen python3 render_icon.py \
+            "$DEST/icons/winlinx.svg" "$DEST/icons" >/dev/null 2>&1; then
+        ok "App icons rendered from winlinx.svg"
+    else
+        warn "could not render app icons from the SVG - the menu entry will show a generic icon"
+    fi
+fi
 mkdir -p "$DEST/quarantine"
 
 mkdir -p "$HOME/.local/share/applications"
@@ -203,12 +259,23 @@ sed "s|@HOME@|$HOME|g" desktop/winlinx-manager.desktop \
 sed "s|@HOME@|$HOME|g" desktop/winlinx-runner.desktop \
     > "$HOME/.local/share/applications/winlinx-runner.desktop" \
     || warn "could not install the file runner entry"
+# Plug-in file types (.vst3 / .dll / .clap) have no standard MIME
+# type, so WinLinx defines its own and registers the runner for them.
+mkdir -p "$HOME/.local/share/mime/packages"
+cp desktop/winlinx-mime.xml \
+   "$HOME/.local/share/mime/packages/winlinx.xml" 2>/dev/null \
+    || warn "could not install the plug-in file types"
+command -v update-mime-database >/dev/null 2>&1 \
+    && update-mime-database "$HOME/.local/share/mime" 2>/dev/null || true
 if command -v xdg-mime >/dev/null 2>&1; then
-    xdg-mime default winlinx-runner.desktop application/x-msdownload 2>/dev/null || true
-    xdg-mime default winlinx-runner.desktop application/x-msi 2>/dev/null || true
-    ok "Double-clicking .exe/.msi files now runs them (scanned first)"
+    for MIME in application/x-msdownload application/x-msi \
+                application/x-winlinx-vst3 application/x-winlinx-vst2 \
+                application/x-winlinx-clap; do
+        xdg-mime default winlinx-runner.desktop "$MIME" 2>/dev/null || true
+    done
+    ok "Double-clicking .exe/.msi files now runs them (scanned first), and double-clicking .vst3/.dll/.clap plug-ins bridges them"
 else
-    warn "xdg-mime not found — double-click may not work; use the watched folders instead"
+    warn "xdg-mime not found - double-click may not work; use the watched folders instead"
 fi
 
 mkdir -p "$HOME/WinLinx/Programs" "$HOME/WinLinx/Plugins"
@@ -222,7 +289,7 @@ if systemctl --user daemon-reload 2>/dev/null \
    && systemctl --user enable --now winlinx-watcher.service 2>/dev/null; then
     ok "Watcher service running"
 else
-    warn "could not start the watcher service — start it by hand with: systemctl --user enable --now winlinx-watcher.service"
+    warn "could not start the watcher service - start it by hand with: systemctl --user enable --now winlinx-watcher.service"
 fi
 
 # ---------------------------------------------------------------- 7. Summary
@@ -231,16 +298,18 @@ say "Done!"
 echo ""
 echo "  HOW TO USE IT"
 echo "  - Drop a Windows installer or program (.exe/.msi) into"
-echo "    ~/WinLinx/Programs — it is scanned, then it runs."
+echo "    ~/WinLinx/Programs - it is scanned, then it runs."
 echo "  - Drop a VST installer (.exe/.msi) or a plug-in file"
-echo "    (.vst3/.dll) into ~/WinLinx/Plugins — it is scanned,"
+echo "    (.vst3/.dll/.clap) into ~/WinLinx/Plugins - it is scanned,"
 echo "    installed, and bridged into ~/.vst3 for your DAW."
-echo "  - Or just double-click any .exe/.msi anywhere — it is"
-echo "    scanned first, then it runs."
+echo "  - Or just double-click any .exe/.msi anywhere - it is"
+echo "    scanned first, then it runs. Double-clicking a"
+echo "    .vst3/.dll/.clap bridges it the same way."
 echo "  - Open 'WinLinx Program Manager' from the menu to see your"
-echo "    programs, plug-ins, quarantined files, and the log."
+echo "    programs, plug-ins, quarantined files, failed drops,"
+echo "    and the log."
 echo ""
-echo "  If something gets flagged, it goes to quarantine — nothing"
+echo "  If something gets flagged, it goes to quarantine - nothing"
 echo "  flagged ever installs or runs. You decide in the manager:"
 echo "  Allow it, or Delete it."
 echo ""

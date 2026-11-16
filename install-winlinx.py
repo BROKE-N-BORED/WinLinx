@@ -2,8 +2,8 @@
 """WinLinx GUI installer launcher (standard library only).
 
 The installer window needs PySide6 (Qt). This launcher makes sure
-it is importable first — installing it via pkexec + apt, or pip
---user as a fallback — then starts the installer window from
+it is importable first - installing it via pkexec + apt, or pip
+--user as a fallback - then starts the installer window from
 winlinx/installer.py. No terminal needed at any point: pkexec shows
 a GUI password prompt, and progress shows in a zenity dialog while
 the packages install (zenity ships with Linux Mint; if it is
@@ -11,6 +11,7 @@ missing, the install just runs quietly in the background).
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -79,7 +80,7 @@ def _install_pyside6_pip():
     """pip --user (no admin rights needed)."""
     if not _run_quiet([sys.executable, "-m", "pip", "--version"],
                       timeout=60):
-        # No pip at all — try to get it, then retry once.
+        # No pip at all - try to get it, then retry once.
         if shutil.which("pkexec"):
             _run_quiet(["pkexec", "bash", "-c",
                         "export DEBIAN_FRONTEND=noninteractive; "
@@ -112,12 +113,26 @@ def ensure_pyside6():
 
 
 def main(argv=None):
+    args = sys.argv if argv is None else argv
+    if "--version" in args or "-V" in args:
+        # The version lives in winlinx/common.py (__version__).
+        version = "unknown"
+        try:
+            text = (HERE / "winlinx" / "common.py").read_text(
+                encoding="utf-8")
+            match = re.search(r'^__version__ = "([^"]+)"', text, re.M)
+            if match:
+                version = match.group(1)
+        except OSError:
+            pass
+        print("WinLinx installer launcher %s" % version)
+        return 0
     if not ensure_pyside6():
         _show_error(
             "WinLinx needs PySide6 (Qt) and could not install it.\n\n"
             "Install it from the Software Manager (search for "
             "python3-pyside6), then double-click Install WinLinx "
-            "again — or run ./install.sh in a terminal instead.")
+            "again - or run ./install.sh in a terminal instead.")
         return 1
     # Small delay so a zenity progress dialog has time to close
     # before the installer window appears.

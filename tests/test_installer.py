@@ -95,6 +95,43 @@ class DryRunStepsTests(unittest.TestCase):
             self.assertEqual(result.status, installer.StepResult.DONE,
                              "step %s: %s" % (key, result.detail))
 
+    def test_yabridge_step_is_pinned_and_verified(self):
+        lines = []
+        ctx = installer.InstallContext(lines.append, dryrun=True)
+        installer.step_yabridge(ctx)
+        blob = "\n".join(lines)
+        self.assertIn("5.1.1", blob)
+        self.assertIn("SHA-256", blob)
+        self.assertNotIn("latest", blob.lower())
+
+    def test_verify_sha256(self):
+        with tempfile.NamedTemporaryFile("wb", delete=False) as fh:
+            fh.write(b"hello world")
+            path = fh.name
+        try:
+            import hashlib
+            digest = hashlib.sha256(b"hello world").hexdigest()
+            self.assertTrue(installer.verify_sha256(path, digest))
+            self.assertFalse(installer.verify_sha256(
+                path, "0" * 64))
+            self.assertFalse(installer.verify_sha256(
+                path + "-missing", digest))
+        finally:
+            os.unlink(path)
+
+    def test_normalize_fingerprint(self):
+        self.assertEqual(
+            installer.normalize_fingerprint(
+                "D43F 6401 4536 9C51 D786 DDEA 76F1 A20F F987 672F"),
+            "D43F640145369C51D786DDEA76F1A20FF987672F")
+
+    def test_wine_step_verifies_key_fingerprint(self):
+        lines = []
+        ctx = installer.InstallContext(lines.append, dryrun=True)
+        installer.step_wine(ctx)
+        blob = "\n".join(lines)
+        self.assertIn("fingerprint", blob.lower())
+
     def test_wine_step_logs_the_real_admin_script(self):
         lines = []
         ctx = installer.InstallContext(lines.append, dryrun=True)

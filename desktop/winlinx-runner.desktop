@@ -3,6 +3,6 @@ Type=Application
 Name=WinLinx Runner
 Exec=@HOME@/.local/share/winlinx/run-windows-file %f
 Icon=@HOME@/.local/share/winlinx/icons/winlinx-256.png
-MimeType=application/x-msdownload;application/x-msi;
+MimeType=application/x-msdownload;application/x-msi;application/x-winlinx-vst3;application/x-winlinx-vst2;application/x-winlinx-clap;
 NoDisplay=true
 Terminal=false

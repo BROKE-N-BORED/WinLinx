@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <!--
+    WinLinx plug-in file types. There is no standard shared-mime-info
+    type for .vst3 / .dll / .clap, so WinLinx defines its own and
+    registers winlinx-runner.desktop as the handler for all three.
+    Installed to ~/.local/share/mime/packages/winlinx.xml by both
+    installers; removed again by uninstall.sh and the GUI uninstaller.
+  -->
+  <mime-type type="application/x-winlinx-vst3">
+    <comment>VST3 plug-in</comment>
+    <glob pattern="*.vst3"/>
+  </mime-type>
+  <mime-type type="application/x-winlinx-vst2">
+    <comment>VST2 plug-in</comment>
+    <glob pattern="*.dll"/>
+  </mime-type>
+  <mime-type type="application/x-winlinx-clap">
+    <comment>CLAP plug-in</comment>
+    <glob pattern="*.clap"/>
+  </mime-type>
+</mime-info>

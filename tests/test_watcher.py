@@ -28,11 +28,11 @@ class StubExecutor:
         self.syncs = 0
         self._lock = threading.Lock()
 
-    def run_detached(self, cmd):
+    def run_detached(self, cmd, env=None):
         with self._lock:
             self.detached.append(list(cmd))
 
-    def run_wait(self, cmd, timeout=None):
+    def run_wait(self, cmd, timeout=None, env=None):
         with self._lock:
             self.waited.append(list(cmd))
         return 0
@@ -227,6 +227,90 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.executor.detached, [])
         log = common.log_path().read_text(encoding="utf-8")
         self.assertIn("Wine is not installed", log)
+
+    def test_failed_item_recorded_with_reason_not_handled(self):
+        # Regression: a program Wine could not run was recorded as
+        # "ran" and never retried.
+        self._stub_scan()
+        self._stub_wine(present=False)
+        target = self._drop(self.programs, "game.exe")
+        self._settle()
+        self.assertEqual(self.executor.detached, [])
+        failed = watcher.load_failed()
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["name"], "game.exe")
+        self.assertIn("Wine is not installed", failed[0]["reason"])
+        self.assertEqual(failed[0]["attempts"], 1)
+        state = watcher._load_state()
+        self.assertEqual(state[str(target)]["action"], "failed")
+
+    def test_failed_item_not_retried_before_backoff(self):
+        self._stub_scan()
+        self._stub_wine(present=False)
+        target = self._drop(self.programs, "game.exe")
+        self._settle()
+        self._settle()
+        state = watcher._load_state()
+        self.assertEqual(state[str(target)]["attempts"], 1)
+
+    def test_failed_item_retried_when_wine_appears(self):
+        self._stub_scan()
+        wine_here = {"present": False}
+        p = mock.patch.object(
+            watcher.common, "find_wine",
+            side_effect=lambda: ("/usr/bin/wine"
+                                 if wine_here["present"] else None))
+        p.start()
+        self._patches.append(p)
+        target = self._drop(self.programs, "game.exe")
+        self._settle()
+        self.assertEqual(self.executor.detached, [])
+        self.assertEqual(len(watcher.load_failed()), 1)
+        # Wine appears; force the retry time into the past.
+        wine_here["present"] = True
+        state = watcher._load_state()
+        state[str(target)]["next_retry"] = 0
+        watcher._save_state(state)
+        self.w = watcher.Watcher(executor=self.executor)
+        self.w.scan_once()
+        _wait_for(lambda: not self.w._busy, timeout=5.0)
+        time.sleep(0.05)
+        self.assertEqual(self.executor.detached,
+                         [["wine", str(target)]])
+        self.assertEqual(watcher.load_failed(), [])
+
+    def test_retry_clears_failed_record(self):
+        # clear_handled is what the manager's Retry button calls.
+        self._stub_scan()
+        self._stub_wine(present=False)
+        target = self._drop(self.programs, "game.exe")
+        self._settle()
+        self.assertEqual(len(watcher.load_failed()), 1)
+        watcher.clear_handled(str(target))
+        self.assertEqual(watcher.load_failed(), [])
+
+    def test_forget_marks_ignored(self):
+        self._stub_scan()
+        self._stub_wine(present=False)
+        target = self._drop(self.programs, "game.exe")
+        self._settle()
+        watcher.ignore_path(str(target))
+        self.assertEqual(watcher.load_failed(), [])
+        state = watcher._load_state()
+        self.assertEqual(state[str(target)]["action"], "ignored")
+        # A later pass leaves it alone.
+        self._settle()
+        self.assertEqual(self.executor.detached, [])
+
+    def test_clap_file_copied_and_synced(self):
+        self._stub_scan()
+        target = self._drop(self.plugins, "Synth.clap", b"CLAPDATA")
+        self._settle()
+        copied = common.vst3_dir() / "Synth.clap"
+        self.assertTrue(copied.exists())
+        self.assertEqual(copied.read_bytes(), b"CLAPDATA")
+        self.assertEqual(self.executor.syncs, 1)
+        self.assertEqual(self.executor.detached, [])
 
     def test_clear_handled_reprocesses(self):
         self._stub_scan()
