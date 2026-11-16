@@ -1,5 +1,28 @@
 # WinLinx changelog
 
+## 0.2.1 - 2026-11-16
+
+Two fixes from running v0.2 as a user (2026-11-16 dogfood review):
+
+- The Program Manager starts again. `QLockFile.tryLock()` needs an
+  argument on PySide6 6.12, and `main()` died before the window opened,
+  so double-clicking the menu icon did nothing. The lock call now
+  passes 0, and a new test launches the real entry point as a
+  subprocess and asserts the window stays up. The single-instance
+  path (a second launch focuses the running window) is verified live
+  by a second new test. While verifying, one more start-up defect
+  was fixed in place: if the lock file cannot even be created (the
+  layer folder is not writable), the manager used to claim WinLinx
+  was already running and hang on that dialog; it now says plainly
+  it cannot start and exits.
+- Cancelling the installer no longer reports "Installed!". A
+  cancelled run says how many steps finished and asks you to press
+  Install to finish; it never enables Launch and never shows 100%.
+  A step that stops because you cancelled is reported as cancelled,
+  not failed. Two new tests drive both cancel variants (step
+  completes normally after cancel; step notices the flag and bails
+  out).
+
 ## 0.2 - 2026-11-15
 
 Fixed (all proven live in the 2026-11-13 deep audit):

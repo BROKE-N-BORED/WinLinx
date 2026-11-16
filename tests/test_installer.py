@@ -197,6 +197,109 @@ class InstallerWindowTests(unittest.TestCase):
                       self.window.log_view.toPlainText())
 
 
+class InstallerCancelTests(unittest.TestCase):
+    """Cancelling must never report "Installed!" (v0.2.1 P0 #2).
+
+    Two variants, both driven through the real window offscreen:
+    (a) cancel during a step that then completes normally, and
+    (b) cancel during a step that notices the flag and returns FAIL
+    (which must be reported as cancelled, not failed). The fake
+    steps replace STEPS so the timing is controllable; the real
+    STEPS list is restored in tearDown.
+    """
+
+    def setUp(self):
+        self._orig_steps = installer.STEPS
+        self.window = None
+
+    def tearDown(self):
+        installer.STEPS = self._orig_steps
+        if self.window is not None:
+            self.window.close()
+            self.window.deleteLater()
+            _APP.processEvents()
+
+    def _start_with_steps(self, step0):
+        def quick_done(ctx):
+            return installer.StepResult(installer.StepResult.DONE)
+
+        installer.STEPS = [
+            ("step0", "First step (slow)", step0),
+        ] + [("step%d" % i, "Step %d" % i, quick_done)
+             for i in range(1, 6)]
+        self.window = installer.InstallerWindow(dryrun=True)
+        self.window.show()
+        _APP.processEvents()
+        self.window.install_btn.click()
+        # Wait until step 0 is running, then cancel mid-step.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            _APP.processEvents()
+            if "running" in self.window.steps_list.item(0).text():
+                break
+            time.sleep(0.05)
+        self.assertIn("running",
+                      self.window.steps_list.item(0).text())
+        self.window.cancel_btn.click()
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            _APP.processEvents()
+            if (self.window._worker is None
+                    and not self.window._installing):
+                break
+            time.sleep(0.05)
+        self.assertFalse(self.window._installing)
+
+    def test_cancel_during_step_that_completes(self):
+        def slow_step(ctx):
+            # Ignores the cancel flag and finishes normally.
+            time.sleep(1.5)
+            return installer.StepResult(installer.StepResult.DONE)
+
+        self._start_with_steps(slow_step)
+        self.assertEqual(
+            self.window.statusBar().currentMessage(),
+            "Install cancelled - 1 of 6 steps done. Press "
+            "Install to finish.")
+        self.assertFalse(self.window.launch_btn.isEnabled())
+        self.assertEqual(self.window.progress_bar.value(), 16)
+        self.assertIn("done",
+                      self.window.steps_list.item(0).text())
+        for index in range(1, 6):
+            self.assertIn(
+                "pending", self.window.steps_list.item(index).text())
+        log = self.window.log_view.toPlainText()
+        self.assertNotIn("Some steps failed", log)
+        self.assertNotIn("Installed!", log)
+        self.assertTrue(self.window.install_btn.isEnabled())
+
+    def test_cancel_during_step_that_noticed(self):
+        def noticing_step(ctx):
+            # Watches the flag and bails out with FAIL: the worker
+            # must report this as cancelled, not failed.
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if ctx.cancelled:
+                    return installer.StepResult(
+                        installer.StepResult.FAIL,
+                        "cancelled by user")
+                time.sleep(0.05)
+            return installer.StepResult(installer.StepResult.DONE)
+
+        self._start_with_steps(noticing_step)
+        self.assertEqual(
+            self.window.statusBar().currentMessage(),
+            "Install cancelled - 0 of 6 steps done. Press "
+            "Install to finish.")
+        self.assertFalse(self.window.launch_btn.isEnabled())
+        self.assertEqual(self.window.progress_bar.value(), 0)
+        self.assertIn("cancelled",
+                      self.window.steps_list.item(0).text())
+        log = self.window.log_view.toPlainText()
+        self.assertNotIn("Some steps failed", log)
+        self.assertNotIn("Installed!", log)
+
+
 class LauncherTests(unittest.TestCase):
     def test_launcher_sees_pyside6(self):
         root = Path(__file__).resolve().parent.parent

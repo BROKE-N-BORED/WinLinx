@@ -3,6 +3,7 @@ Runs offscreen (QT_QPA_PLATFORM=offscreen); fake home via WINLINX_HOME."""
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,6 +20,7 @@ import fakehome  # noqa: E402
 import scanner  # noqa: E402
 
 from PySide6.QtCore import Qt, QTimer  # noqa: E402
+from PySide6.QtNetwork import QLocalSocket  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 import manager  # noqa: E402
@@ -85,7 +87,8 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(labels[5], "System")
 
     def test_window_title_has_version(self):
-        self.assertIn("0.2", self.window.windowTitle())
+        self.assertIn(manager.common.__version__,
+                      self.window.windowTitle())
         self.assertIn("WinLinx Program Manager",
                       self.window.windowTitle())
 
@@ -219,6 +222,133 @@ class ManagerTests(unittest.TestCase):
                           dialog.text.toPlainText())
         finally:
             dialog.close()
+
+
+class ManagerMainTests(unittest.TestCase):
+    """Regression tests for the real entry point (v0.2.1 P0 #1).
+
+    v0.2 shipped a manager that could not start: main() called
+    QLockFile.tryLock() with no argument, which raises TypeError on
+    PySide6 6.12, and no test ever called main() - the suite only
+    ever built ManagerWindow directly. These tests spawn the real
+    `python3 winlinx/manager.py` as a subprocess, offscreen, in a
+    fresh fake home.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self._procs = []
+        self._env = dict(os.environ)
+        self._env["QT_QPA_PLATFORM"] = "offscreen"
+        self._env["WINLINX_HOME"] = str(self.home)
+        self._env["HOME"] = str(self.home)
+
+    def tearDown(self):
+        for proc in self._procs:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate(timeout=10)
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+        self._tmp.cleanup()
+
+    def _launch(self):
+        root = Path(__file__).resolve().parent.parent
+        proc = subprocess.Popen(
+            [sys.executable, str(root / "winlinx" / "manager.py")],
+            env=self._env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        self._procs.append(proc)
+        return proc
+
+    def _wait_until_up(self, proc, timeout=20.0):
+        # Up = the single-instance lock file exists and the process
+        # is still alive. The lock is taken before the window is
+        # built, so this also proves main() got past tryLock().
+        lock = (self.home / ".local" / "share" / "winlinx"
+                / "manager.lock")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return False
+            if lock.exists():
+                return True
+            time.sleep(0.1)
+        return lock.exists() and proc.poll() is None
+
+    def _fail_with_stderr(self, proc, message):
+        _out, err = proc.communicate(timeout=5)
+        self.fail("%s (rc=%s): %s"
+                  % (message, proc.returncode, err[-2000:]))
+
+    def test_main_starts_and_stays_up(self):
+        proc = self._launch()
+        if not self._wait_until_up(proc):
+            self._fail_with_stderr(proc,
+                                   "manager exited during startup")
+        # Still up a moment later: it did not crash after opening.
+        time.sleep(2)
+        self.assertIsNone(proc.poll(), "manager died after starting")
+        proc.terminate()
+        _out, err = proc.communicate(timeout=10)
+        self.assertNotIn("Traceback", err)
+
+    def test_second_launch_pokes_running_window(self):
+        first = self._launch()
+        if not self._wait_until_up(first):
+            self._fail_with_stderr(first,
+                                   "first manager exited at startup")
+        # Wait until the running instance is listening, probing it
+        # the same way a second launch does.
+        sock = QLocalSocket()
+        deadline = time.time() + 10
+        connected = False
+        while time.time() < deadline:
+            sock.connectToServer(manager.SERVER_NAME)
+            if sock.waitForConnected(1000):
+                connected = True
+                break
+            sock.abort()
+            time.sleep(0.2)
+        self.assertTrue(connected,
+                        "running manager never started listening")
+        sock.write(b"raise")
+        sock.waitForBytesWritten(1000)
+        sock.disconnectFromServer()
+        # A second launch must exit promptly with code 0, and the
+        # first instance must still be alive afterwards.
+        root = Path(__file__).resolve().parent.parent
+        second = subprocess.run(
+            [sys.executable, str(root / "winlinx" / "manager.py")],
+            env=self._env, capture_output=True, text=True,
+            timeout=20)
+        self.assertEqual(second.returncode, 0, second.stderr[-2000:])
+        self.assertNotIn("Traceback", second.stderr)
+        self.assertIsNone(first.poll(),
+                          "first instance died after second launch")
+
+    def test_unwritable_layer_dir_exits_with_plain_error(self):
+        # If the lock file cannot even be created, main() must say
+        # so and exit 1 - not claim WinLinx is already running and
+        # hang on a modal dialog (seen live during verification:
+        # a transient /tmp write freeze left the manager sitting
+        # on the "already running" dialog for a home it never
+        # wrote to).
+        env = dict(self._env)
+        env["WINLINX_HOME"] = "/proc/winlinx-cannot-write-here"
+        root = Path(__file__).resolve().parent.parent
+        proc = subprocess.run(
+            [sys.executable, str(root / "winlinx" / "manager.py")],
+            env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
+        self.assertIn("cannot create", proc.stderr)
+        self.assertNotIn("already running", proc.stderr)
 
 
 if __name__ == "__main__":

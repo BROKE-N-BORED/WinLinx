@@ -44,7 +44,7 @@ class BuildZipTests(unittest.TestCase):
                 capture_output=True, text=True, env=env, timeout=300)
             self.assertEqual(proc.returncode, 0,
                              proc.stdout + proc.stderr)
-            zip_path = tree / "winlinx-v0.2.zip"
+            zip_path = tree / ("winlinx-v%s.zip" % build_zip.VERSION)
             self.assertTrue(zip_path.is_file())
             # The PNGs were rendered as part of the build.
             for size in (256, 128, 48):
@@ -72,7 +72,7 @@ class BuildZipTests(unittest.TestCase):
                            cwd=str(out), check=True, timeout=120)
             for name in ("install.sh", "Install WinLinx.desktop",
                          "winlinx/run-windows-file"):
-                path = out / "winlinx-v0.2" / name
+                path = out / ("winlinx-v%s" % build_zip.VERSION) / name
                 self.assertTrue(os.access(path, os.X_OK), name)
 
 
@@ -151,7 +151,7 @@ class SourceHygieneTests(unittest.TestCase):
                 ["bash", str(ROOT / script), "--version"],
                 capture_output=True, text=True, timeout=30)
             self.assertEqual(proc.returncode, 0, script)
-            self.assertIn("0.2", proc.stdout, script)
+            self.assertIn(build_zip.VERSION, proc.stdout, script)
             self.assertNotIn("unknown", proc.stdout, script)
 
     def test_python_version_flags(self):
@@ -162,7 +162,7 @@ class SourceHygieneTests(unittest.TestCase):
                 [sys.executable, str(ROOT / script), "--version"],
                 capture_output=True, text=True, timeout=30)
             self.assertEqual(proc.returncode, 0, script)
-            self.assertIn("0.2", proc.stdout, script)
+            self.assertIn(build_zip.VERSION, proc.stdout, script)
 
 
 if __name__ == "__main__":

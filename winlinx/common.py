@@ -25,7 +25,7 @@ from pathlib import Path
 
 # Single source of truth for the WinLinx version. Every other file
 # imports this (Python) or reads it out of this file (shell scripts).
-__version__ = "0.2"
+__version__ = "0.2.1"
 
 UPDATE_API_URL = ("https://api.github.com/repos/BROKE-N-BORED/"
                   "WinLinx/releases/latest")

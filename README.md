@@ -1,4 +1,4 @@
-# WinLinx 0.2
+# WinLinx 0.2.1
 
 After installing this once, Windows programs and VST plug-ins just
 work on Linux Mint - no manual setup per file, ever.
@@ -79,7 +79,7 @@ Wine, yabridge, and ClamAV stay installed; your Wine prefix,
 `~/WinLinx`, and quarantined files are left alone (quarantined
 files move to `~/WinLinx/Quarantine`).
 
-## Honest limits (0.2)
+## Honest limits (0.2.1)
 
 - Not every Windows program runs under Wine - some copy protection
   and some iLok-protected plug-ins fail. That is a Wine limit, not

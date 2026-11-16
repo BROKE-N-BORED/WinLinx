@@ -243,6 +243,7 @@ class StepResult:
     DONE = "done"
     WARN = "warning"
     FAIL = "failed"
+    CANCELLED = "cancelled"
 
     def __init__(self, status, detail=""):
         self.status = status
@@ -649,19 +650,25 @@ class InstallWorker(QThread):
     log_line = Signal(str)
     step_status = Signal(int, str)
     progress = Signal(int)
-    finished = Signal(object)  # list of StepResult
+    finished = Signal(object)  # (list of StepResult, cancelled bool)
 
     def __init__(self, dryrun=False, parent=None):
         super().__init__(parent)
         self._dryrun = dryrun
         self._ctx = None
+        # Set by cancel() even before run() has created the context,
+        # so a cancel clicked the instant the install starts is not
+        # lost (the old code only set ctx.cancelled when ctx existed).
+        self._cancel_requested = False
 
     def cancel(self):
+        self._cancel_requested = True
         if self._ctx is not None:
             self._ctx.cancelled = True
 
     def run(self):
         ctx = InstallContext(self.log_line.emit, dryrun=self._dryrun)
+        ctx.cancelled = self._cancel_requested
         self._ctx = ctx
         results = []
         total = len(STEPS)
@@ -679,10 +686,17 @@ class InstallWorker(QThread):
             except Exception as exc:  # noqa: BLE001 - warn, carry on
                 ctx.log("WARNING: step failed with an error: %s" % exc)
                 result = StepResult(StepResult.FAIL, str(exc))
+            if ctx.cancelled and result.status == StepResult.FAIL:
+                # The step noticed the cancel flag and bailed out:
+                # that is a cancellation, not a failure. Report it
+                # as cancelled so the run is never called failed
+                # for a stop the user asked for.
+                result = StepResult(StepResult.CANCELLED,
+                                    result.detail)
             results.append(result)
             self.step_status.emit(index, result.status)
             self.progress.emit(int((index + 1) * 100 / total))
-        self.finished.emit(results)
+        self.finished.emit((results, ctx.cancelled))
 
 
 # ---------------------------------------------------------------- window
@@ -693,6 +707,7 @@ STATUS_LABEL = {
     StepResult.DONE: "done",
     StepResult.WARN: "warning",
     StepResult.FAIL: "failed",
+    StepResult.CANCELLED: "cancelled",
 }
 
 
@@ -815,13 +830,31 @@ class InstallerWindow(QMainWindow):
         label = STATUS_LABEL.get(status, status)
         self.steps_list.item(index).setText("%s - %s" % (title, label))
 
-    def _on_finished(self, results):
+    def _on_finished(self, payload):
+        results, cancelled = payload
         self._installing = False
         self._worker = None
         self._results = results
         self.cancel_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
         self.install_btn.setEnabled(True)
+        if cancelled:
+            # A cancelled run is never "Installed!" and never 100%:
+            # say plainly how far it got and how to finish it, and
+            # leave Launch disabled (a half-done install must not
+            # offer to launch an app that may not be there yet).
+            done = len([r for r in results
+                        if r.status in (StepResult.DONE,
+                                        StepResult.WARN)])
+            total = len(STEPS)
+            self.progress_bar.setValue(int(done * 100 / total))
+            self.statusBar().showMessage(
+                "Install cancelled - %d of %d steps done. Press "
+                "Install to finish." % (done, total))
+            self._log("")
+            self._log("Install cancelled - %d of %d steps done. "
+                      "Press Install to finish." % (done, total))
+            return
         failed = [r for r in results if r.status == StepResult.FAIL]
         warned = [r for r in results if r.status == StepResult.WARN]
         self.progress_bar.setValue(100)

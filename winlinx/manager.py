@@ -1802,7 +1802,15 @@ def main(argv=None):
     except OSError:
         pass
     lock = QLockFile(str(lock_path))
-    if not lock.tryLock():
+    if not lock.tryLock(0):
+        if not lock_path.exists():
+            # The lock file could not even be created (the layer
+            # folder is not writable): nothing is running, so do
+            # not claim WinLinx is already running - say so
+            # plainly and exit instead of hanging on a dialog.
+            print("WinLinx cannot start: cannot create %s"
+                  % lock_path, file=sys.stderr)
+            return 1
         sock = QLocalSocket()
         sock.connectToServer(SERVER_NAME)
         if sock.waitForConnected(1000):

@@ -184,7 +184,7 @@ class ScanPluginsTests(CommonTestBase):
 
 class VersionTests(CommonTestBase):
     def test_version_is_single_sourced(self):
-        self.assertEqual(common.__version__, "0.2")
+        self.assertEqual(common.__version__, "0.2.1")
 
     def test_parse_version(self):
         self.assertEqual(common._parse_version("v0.2"), (0, 2))
@@ -282,7 +282,7 @@ class DebugLogTests(CommonTestBase):
         self.assertIsNotNone(report)
         self.assertTrue(report.is_file())
         text = report.read_text(encoding="utf-8")
-        self.assertIn("WinLinx version: 0.2", text)
+        self.assertIn("WinLinx version: 0.2.1", text)
         self.assertNotIn("SHOULDNOTAPPEAR", text)
         self.assertNotIn(str(self.home), text)
         self.assertIn("~", text)
