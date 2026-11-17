@@ -11,7 +11,12 @@ no inotify dependency) and makes dropped files Just Work:
                                    matching Wine VST folder,
                                    then sync
   Dropped folders:  scanned; a .vst3 bundle in Plugins is bridged,
-                    anything else is left in place with a log note.
+                    anything else is recorded as a failed drop so it
+                    shows in the Program Manager instead of vanishing.
+  Unsupported files (.zip, .txt, ...): logged and recorded as failed
+                    with a plain reason, so they show in Failed Drops
+                    too. They are never retried automatically: a retry
+                    cannot make an unsupported file supported.
 
 Nothing runs before it is scanned. A flagged file is moved to
 quarantine instead - it is never installed or executed. The user
@@ -52,6 +57,56 @@ PROGRAM_EXTS = {".exe", ".msi"}
 PLUGIN_EXTS = {".exe", ".msi", ".vst3", ".dll", ".clap"}
 # Retry backoff for failed items, in seconds (attempt 1, 2, 3, 4+).
 RETRY_BACKOFF = (60, 300, 1800, 3600)
+
+# Plain reasons for files and folders WinLinx cannot handle. No tool
+# names, no em-dashes: these strings show in Failed Drops.
+UNSUPPORTED_ZIP_REASON = (
+    "Unzip it first - WinLinx handles .exe, .msi, .vst3, .dll and "
+    ".clap files")
+UNSUPPORTED_REASON = (
+    "WinLinx handles .exe, .msi, .vst3, .dll and .clap files")
+FOLDER_REASON = (
+    "WinLinx cannot open folders - open it and double-click the "
+    "program inside to run it")
+FOLDER_VST3_IN_PROGRAMS_REASON = (
+    "Plug-ins go in the Plugins folder - move this folder to "
+    "~/WinLinx/Plugins")
+
+
+def _unsupported_reason(path):
+    if path.suffix.lower() == ".zip":
+        return UNSUPPORTED_ZIP_REASON
+    return UNSUPPORTED_REASON
+
+
+def _folder_reason(path, kind):
+    if path.name.lower().endswith(".vst3") and kind == "program":
+        return FOLDER_VST3_IN_PROGRAMS_REASON
+    return FOLDER_REASON
+
+
+def _plain_sync_reason(message):
+    """User-facing reason for a failed bridge sync, in plain words:
+    the tool name never reaches anything the user reads (Failed
+    Drops, notifications). Delegates to the shared mapper in common
+    when it exists, so the watcher, the manager, and the runner all
+    say the same thing; the local fallback covers an older common."""
+    text = message or ""
+    mapper = getattr(common, "plain_drop_reason", None)
+    if mapper is not None:
+        mapped = mapper(text)
+        if mapped != text:
+            return mapped
+    if text.startswith("yabridge is not installed"):
+        return text
+    if "yabridgectl" in text:
+        return ("yabridge is not installed, so the plug-in could not "
+                "be bridged")
+    if "bridge sync failed" in text.lower():
+        return "the plug-in folders could not be re-synced"
+    if text:
+        return "bridge sync failed (%s)" % text
+    return "bridge sync failed"
 
 
 # ---------------------------------------------------------------- logging
@@ -172,10 +227,21 @@ class Watcher:
         self._busy = set()    # paths currently being handled
         self._lock = threading.Lock()
         self._handled = _load_state()
+        # First-attempt failures waiting to be notified, grouped by
+        # reason so one drop produces one notification per reason.
+        # They are flushed at the start of the next scan pass (and
+        # by --once before it exits): no timer thread, so nothing
+        # can fire after the watcher is gone.
+        self._pending_failures = {}
+        self._pending_lock = threading.Lock()
 
     # -- public -----------------------------------------------------
 
     def scan_once(self):
+        # Send the batched failure notifications queued since the
+        # last pass before looking for new work. A slow worker that
+        # has not finished yet reports at a later pass.
+        self._flush_failure_notifications()
         self._scan_folder(common.programs_folder(), "program")
         self._scan_folder(common.plugins_folder(), "plugin")
 
@@ -203,9 +269,12 @@ class Watcher:
             if entry.is_dir():
                 self._consider(entry, kind, is_dir=True)
             elif entry.is_file():
-                allowed = PROGRAM_EXTS if kind == "program" else PLUGIN_EXTS
-                if entry.suffix.lower() in allowed:
-                    self._consider(entry, kind, is_dir=False)
+                if entry.name.startswith("."):
+                    continue  # hidden files are not drops
+                # Every file is considered, not just allow-listed
+                # extensions: unsupported files are logged and
+                # recorded as failed instead of vanishing silently.
+                self._consider(entry, kind, is_dir=False)
 
     def _fingerprint(self, path, is_dir):
         try:
@@ -225,6 +294,11 @@ class Watcher:
         if (record and record.get("size") == fingerprint[0]
                 and record.get("mtime") == fingerprint[1]):
             if record.get("action") == "failed":
+                if record.get("permanent"):
+                    # It will never succeed by retrying (an
+                    # unsupported file, a folder): leave it for the
+                    # user to Forget, or Retry after changing it.
+                    return
                 if time.time() < record.get("next_retry", 0):
                     return  # not time to retry yet
                 # Retry time: the file is unchanged, so it is stable
@@ -261,7 +335,7 @@ class Watcher:
             with self._lock:
                 self._busy.discard(str(path))
 
-    def _mark_handled(self, path, fingerprint, action):
+    def _mark_handled(self, path, fingerprint, action, quiet=False):
         with self._lock:
             old = self._handled.get(str(path)) or {}
             was_failed = old.get("action") == "failed"
@@ -272,19 +346,21 @@ class Watcher:
                 "time": datetime.now().isoformat(timespec="seconds"),
             }
             _save_state(self._handled)
-        if was_failed:
+        if was_failed and not quiet:
             # It works now after failing before: say so, once.
             common.notify("WinLinx", "%s is working now."
                           % path.name)
 
-    def _mark_failed(self, path, fingerprint, reason):
+    def _mark_failed(self, path, fingerprint, reason, permanent=False):
         """Record the real outcome: failed, with the reason, an
         attempt count, and the next retry time. Never recorded as
-        handled."""
+        handled. A permanent failure (an unsupported file, a folder)
+        is never retried automatically: only a change to the file,
+        or the user's Retry, brings it back."""
         with self._lock:
             old = self._handled.get(str(path)) or {}
             attempts = int(old.get("attempts", 0)) + 1
-            self._handled[str(path)] = {
+            record = {
                 "size": fingerprint[0],
                 "mtime": fingerprint[1],
                 "action": "failed",
@@ -293,14 +369,58 @@ class Watcher:
                 "next_retry": time.time() + _backoff_seconds(attempts),
                 "time": datetime.now().isoformat(timespec="seconds"),
             }
+            if permanent:
+                record["permanent"] = True
+            self._handled[str(path)] = record
             _save_state(self._handled)
         if attempts == 1:
-            common.notify("WinLinx",
-                          "%s could not be handled: %s"
-                          % (path.name, reason))
+            self._queue_failure_notification(path.name, reason)
+
+    # -- batched failure notifications -------------------------------
+
+    def _queue_failure_notification(self, name, reason):
+        """Hold a first-attempt failure so same-reason failures from
+        one drop land as one notification ("3 files could not be
+        handled: Wine is not installed") instead of a stack of
+        popups. Flushed at the start of the next scan pass."""
+        with self._pending_lock:
+            self._pending_failures.setdefault(reason, []).append(name)
+
+    def _flush_failure_notifications(self):
+        """Send one notification per pending failure reason, each
+        pointing at the Program Manager. Called at the start of
+        every scan pass, and by --once before it exits."""
+        with self._pending_lock:
+            pending = self._pending_failures
+            self._pending_failures = {}
+        for reason, names in sorted(pending.items()):
+            if len(names) == 1:
+                message = ("%s could not be handled: %s - see the "
+                           "WinLinx Program Manager."
+                           % (names[0], reason))
+            else:
+                message = ("%d files could not be handled: %s - see "
+                           "the WinLinx Program Manager."
+                           % (len(names), reason))
+            common.notify("WinLinx", message)
 
     def _handle(self, path, kind, is_dir, fingerprint):
+        # 0. Unsupported files: never scanned, never run. Logged and
+        # recorded as failed so they show in Failed Drops instead of
+        # vanishing silently (a .zip is the most common way VSTs and
+        # programs are distributed).
+        if not is_dir:
+            allowed = PROGRAM_EXTS if kind == "program" else PLUGIN_EXTS
+            if path.suffix.lower() not in allowed:
+                reason = _unsupported_reason(path)
+                log("Unsupported file dropped: %s - %s"
+                    % (path.name, reason))
+                self._mark_failed(path, fingerprint, reason,
+                                  permanent=True)
+                return
+
         # 1. Scan gate: nothing runs before it is scanned.
+        scanned_clean = False
         if scanner.is_allowlisted(path):
             log("Allowlisted, skipping scan: %s" % path.name)
         else:
@@ -320,6 +440,7 @@ class Watcher:
                 return
             else:
                 log("Scan clean: %s" % path.name)
+                scanned_clean = True
 
         # 2. Normal handling. Helpers report (ok, reason); a failure
         # is recorded as failed, never as handled.
@@ -337,10 +458,20 @@ class Watcher:
                     return
                 self._mark_handled(path, fingerprint, "bridged-vst3-dir")
             else:
-                log("Folder scanned clean, left in place: %s "
-                    "(open it and double-click the program inside to run it)"
-                    % path.name)
-                self._mark_handled(path, fingerprint, "folder-scanned")
+                # A dropped folder is not ignored: it is recorded as
+                # a failed drop so the manager shows it, with what to
+                # do next. Only claim a scan ran when one did.
+                if scanned_clean:
+                    log("Folder scanned clean, left in place: %s "
+                        "(open it and double-click the program inside "
+                        "to run it)" % path.name)
+                else:
+                    log("Folder left in place: %s (open it and "
+                        "double-click the program inside to run it)"
+                        % path.name)
+                self._mark_failed(path, fingerprint,
+                                  _folder_reason(path, kind),
+                                  permanent=True)
             return
 
         ext = path.suffix.lower()
@@ -358,8 +489,17 @@ class Watcher:
             elif reason == "sync failed":
                 # The installer itself ran: do not re-run it on retry.
                 # The plug-in folders can be re-synced from the
-                # manager instead.
-                self._mark_handled(path, fingerprint, "installed")
+                # manager instead - but say so once, or the plug-in
+                # is silently missing from the DAW.
+                self._mark_handled(path, fingerprint, "installed",
+                                   quiet=True)
+                log("WARNING: %s installed but the plug-in folders "
+                    "could not be re-synced" % path.name)
+                common.notify(
+                    "WinLinx",
+                    "%s installed, but the plug-in folders could not "
+                    "be re-synced - press Re-sync Bridges in the "
+                    "Program Manager" % path.name)
             else:
                 self._mark_failed(path, fingerprint, reason)
         elif ext == ".vst3":
@@ -446,7 +586,7 @@ class Watcher:
         if ok:
             log("Bridges re-synced")
             return True, ""
-        reason = "bridge sync failed (%s)" % message
+        reason = _plain_sync_reason(message)
         log("WARNING: %s" % reason)
         return False, reason
 
@@ -492,6 +632,10 @@ def main(argv=None):
         while watcher._busy and time.time() < deadline:
             time.sleep(0.2)
         time.sleep(0.5)
+        # The next scan pass would flush these; --once has no next
+        # pass, so flush before exiting or the notifications would
+        # silently never be sent.
+        watcher._flush_failure_notifications()
         return 0
     watcher.run_forever(interval=args.interval)
     return 0

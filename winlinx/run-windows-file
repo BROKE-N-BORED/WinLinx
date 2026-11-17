@@ -61,12 +61,86 @@ program_prefix() {
 
 sync_bridges() {
     CTL="$(find_yabridgectl)"
-    if [ -n "$CTL" ] && "$CTL" sync >/dev/null 2>&1; then
+    if [ -z "$CTL" ]; then
+        SYNC_REASON="yabridge is not installed"
+        say "WARNING: bridge sync failed ($SYNC_REASON)"
+        return 1
+    fi
+    if "$CTL" sync >/dev/null 2>&1; then
         say "Bridges re-synced"
         return 0
     fi
-    say "WARNING: bridge sync failed"
+    SYNC_REASON="the plug-in folders could not be re-synced"
+    say "WARNING: bridge sync failed ($SYNC_REASON)"
     return 1
+}
+
+# Set by sync_bridges on failure: the plain reason, for the
+# notification and the Failed Drops record.
+SYNC_REASON=""
+
+# Record a double-click failure as a failed drop in handled.json, in
+# the same format the watcher writes, so it shows in the Program
+# Manager's Failed Drops tab (with Retry / Forget) instead of
+# leaving only a notification behind. Never fails the runner: a
+# missing python3 or an unwritable state file just means no record.
+record_failed() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    FILE_PATH="$1" FAIL_REASON="$2" LAYER_DIR="$LAYER" python3 - <<'PYEOF' 2>/dev/null
+import json, os, time
+from datetime import datetime
+from pathlib import Path
+layer = Path(os.environ["LAYER_DIR"])
+path = Path(os.environ["FILE_PATH"])
+state_path = layer / "handled.json"
+try:
+    st = path.stat()
+    size, mtime = st.st_size, st.st_mtime_ns
+except OSError:
+    size, mtime = 0, 0
+try:
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+old = data.get(str(path)) or {}
+attempts = int(old.get("attempts", 0)) + 1
+backoff = (60, 300, 1800, 3600)[min(max(attempts - 1, 0), 3)]
+data[str(path)] = {
+    "size": size,
+    "mtime": mtime,
+    "action": "failed",
+    "reason": os.environ["FAIL_REASON"],
+    "attempts": attempts,
+    "next_retry": time.time() + backoff,
+    "time": datetime.now().isoformat(timespec="seconds"),
+}
+layer.mkdir(parents=True, exist_ok=True)
+tmp = state_path.with_suffix(state_path.suffix + ".tmp")
+tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+os.replace(tmp, state_path)
+PYEOF
+    return 0
+}
+
+# After a plug-in copy: sync, then say plainly what happened. Only a
+# sync that returned 0 earns the "bridged" notification; a failure is
+# notified as a failure (plain words, no tool name) and recorded as
+# a failed drop.
+finish_plugin() {
+    local file="$1" name="$2" into="$3" fail_reason
+    if sync_bridges; then
+        notify "$name was bridged into $into for your DAW."
+    else
+        if [ "$SYNC_REASON" = "yabridge is not installed" ]; then
+            fail_reason="yabridge is not installed, so the plug-in could not be bridged"
+        else
+            fail_reason="the plug-in folders could not be re-synced"
+        fi
+        notify "$name could not be bridged - $SYNC_REASON. See the WinLinx Program Manager."
+        record_failed "$file" "$fail_reason"
+    fi
 }
 
 EXT="$(echo "${FILE##*.}" | tr '[:upper:]' '[:lower:]')"
@@ -99,6 +173,7 @@ case "$EXT" in
         if ! command -v wine >/dev/null 2>&1; then
             say "WARNING: Wine is not installed, cannot run $NAME"
             notify "Wine is not installed, so $NAME cannot run."
+            record_failed "$FILE" "Wine is not installed"
             exit 0
         fi
         PREFIX="$(program_prefix "$NAME")"
@@ -118,32 +193,29 @@ case "$EXT" in
             rm -rf "$DEST/$NAME" 2>/dev/null
             cp -r "$FILE" "$DEST/" 2>/dev/null \
                 && say "Copied $NAME to $DEST" \
-                || { say "ERROR copying $NAME"; exit 0; }
+                || { say "ERROR copying $NAME"; record_failed "$FILE" "copy failed"; exit 0; }
         else
             cp "$FILE" "$DEST/" 2>/dev/null \
                 && say "Copied $NAME to $DEST" \
-                || { say "ERROR copying $NAME"; exit 0; }
+                || { say "ERROR copying $NAME"; record_failed "$FILE" "copy failed"; exit 0; }
         fi
-        sync_bridges
-        notify "$NAME was bridged into ~/.vst3 for your DAW."
+        finish_plugin "$FILE" "$NAME" "~/.vst3"
         ;;
     dll)
         DEST="$HOME/.wine/drive_c/Program Files/Common Files/VST2"
         mkdir -p "$DEST"
         cp "$FILE" "$DEST/" 2>/dev/null \
             && say "Copied $NAME to $DEST" \
-            || { say "ERROR copying $NAME"; exit 0; }
-        sync_bridges
-        notify "$NAME was bridged into ~/.vst for your DAW."
+            || { say "ERROR copying $NAME"; record_failed "$FILE" "copy failed"; exit 0; }
+        finish_plugin "$FILE" "$NAME" "~/.vst"
         ;;
     clap)
         DEST="$HOME/.wine/drive_c/Program Files/Common Files/VST3"
         mkdir -p "$DEST"
         cp "$FILE" "$DEST/" 2>/dev/null \
             && say "Copied $NAME to $DEST" \
-            || { say "ERROR copying $NAME"; exit 0; }
-        sync_bridges
-        notify "$NAME was bridged into ~/.clap for your DAW."
+            || { say "ERROR copying $NAME"; record_failed "$FILE" "copy failed"; exit 0; }
+        finish_plugin "$FILE" "$NAME" "~/.clap"
         ;;
 esac
 exit 0

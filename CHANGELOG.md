@@ -1,5 +1,87 @@
 # WinLinx changelog
 
+## 0.3 - 2026-11-16
+
+The rest of the 2026-11-16 dogfood review (tasks 3-45): everything the
+review found wrong, confusing, or missing, fixed in one release.
+
+Plain words everywhere:
+
+- Double-clicking a plug-in no longer says "bridged" when the sync
+  failed. It says so plainly and points at the Program Manager.
+- Launch, Re-sync Bridges, update checks, and ClamAV installs no
+  longer show raw exceptions, tool names, or exit codes. The detail
+  stays in the log; the user gets plain words and what to do next.
+- Failed Drops reasons say "yabridge is not installed, so the plug-in
+  could not be bridged" instead of leaking `yabridgectl`.
+
+The manager tells you what happened:
+
+- Action confirmations (Kill, Allow, Delete, Forget, Retry,
+  Quarantine, Uninstall, Remove) survive the refresh instead of being
+  overwritten by the count summary.
+- Empty Programs and Plug-ins tabs explain what to do next, with an
+  F1 pointer to How to Use.
+- Columns no longer cut off the important part: wider defaults,
+  middle-elided paths (`.../FooApp/foo.exe`), full text in tooltips,
+  all threats shown.
+- Action buttons stay disabled until a row is selected. Forget asks
+  first (default No). The uninstall dialog's safe button has focus.
+- Programs get per-program glyph icons instead of the same penguin on
+  every row. The Prefix column reads "Own prefix" / "Shared prefix".
+- The Plug-ins tab explains "Not bridged" / "Source missing" and what
+  to do; Source File shows the file you dropped.
+- Quarantine search covers threat names; a no-match search says so
+  and the status bar shows the filtered count.
+- The threats dialog lists the file once with deduplicated threat
+  names. "Can't uninstall" offers an Open Install Folder button.
+- How to Use has a Close button; the scan picker has a Cancel button.
+  The password-prompt fallbacks explain why before giving a terminal
+  command.
+- Activity warnings and errors are coloured, with a warnings-only
+  filter. Tab counts hide when zero. The System tab says "No prefix
+  yet" when there is none. The Windows version menu is newest-first
+  with radio behaviour.
+
+Installer honesty:
+
+- A step that skips its core work (no wineboot, no yabridgectl,
+  wineboot failed) reports a warning, so the run says "Installed with
+  warning(s)" instead of a green "Installed!".
+- The progress bar goes busy while a step runs, and stops at the
+  completed fraction on a failed run instead of hitting 100%.
+- The step list no longer renders a selection and is sized to its
+  content.
+
+Watcher and double-click:
+
+- Unsupported drops (.zip, .txt, ...) are logged and recorded as
+  failed with a plain reason, so they show in Failed Drops instead of
+  vanishing. (.zip extraction itself is still a follow-up.)
+- Failure notifications are batched per reason ("3 files could not be
+  handled: Wine is not installed") and point at the Program Manager.
+- Dropped folders are recorded as failed with guidance instead of
+  being silently ignored; the log says "Folder left in place" when no
+  scan ran.
+- An installer that installs but fails the bridge sync notifies once
+  instead of failing silently. Double-click failures are recorded as
+  failed drops, so they show in the manager with Retry and Forget.
+
+System tab and maintenance:
+
+- Missing Wine or yabridge gets an "Install or Repair" action that
+  re-runs the installer; the watcher status line explains itself.
+- Check for Updates lives in the Help menu only (was three places);
+  the System tab drops its duplicate Re-sync, Updates, and Debug
+  Report buttons.
+- Update Signatures checks ClamAV is installed first and offers to
+  install it when it is not. Kill no longer claims success when
+  nothing was running.
+- Restore names where the old prefix went, and old aside copies are
+  pruned to the newest per prefix. The debug report adds watcher
+  status, quarantine/failed counts, and system info. Backup progress
+  reports by bytes as well as files.
+
 ## 0.2.1 - 2026-11-16
 
 Two fixes from running v0.2 as a user (2026-11-16 dogfood review):

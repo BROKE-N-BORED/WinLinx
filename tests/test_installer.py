@@ -1,4 +1,4 @@
-"""Tests for winlinx/installer.py — the Qt GUI installer.
+"""Tests for winlinx/installer.py - the Qt GUI installer.
 
 Runs offscreen (QT_QPA_PLATFORM=offscreen). The install steps are
 exercised in dry-run mode only: no apt installs, no pkexec, no
@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import installer  # noqa: E402
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication, QAbstractItemView)
 
 _APP = None
 
@@ -161,6 +162,72 @@ class DryRunStepsTests(unittest.TestCase):
         self.assertIn("winlinx-manager.desktop", blob)
 
 
+class StepPrefixWarnTests(unittest.TestCase):
+    """step_prefix must report WARN, not DONE, when it skips its
+    core work (v0.3 task 9). The context is real but non-dry-run,
+    with which/run stubbed so no Wine or yabridge is needed; home
+    points at a temp dir so the VST mkdirs land nowhere real."""
+
+    def _ctx(self, which=None, run_code=0):
+        lines = []
+        ctx = installer.InstallContext(lines.append, dryrun=False)
+        ctx.home = Path(tempfile.mkdtemp())
+        found = which or {}
+        ctx.which = lambda name: found.get(name)
+        if callable(run_code):
+            ctx.run = lambda cmd, timeout=None: run_code(cmd)
+        else:
+            ctx.run = lambda cmd, timeout=None: run_code
+        return ctx, lines
+
+    def test_warns_when_wineboot_and_yabridgectl_missing(self):
+        ctx, lines = self._ctx()
+        result = installer.step_prefix(ctx)
+        self.assertEqual(result.status, installer.StepResult.WARN)
+        self.assertIn("wineboot", result.detail)
+        blob = "\n".join(lines)
+        self.assertIn("wineboot not found", blob)
+        self.assertIn("yabridgectl not found", blob)
+
+    def test_warns_when_wineboot_fails(self):
+        def run(cmd, timeout=None):
+            return 1 if str(cmd[0]).endswith("wineboot") else 0
+
+        ctx, _lines = self._ctx(
+            which={"wineboot": "/usr/bin/wineboot",
+                   "yabridgectl": "/usr/bin/yabridgectl"},
+            run_code=run)
+        result = installer.step_prefix(ctx)
+        self.assertEqual(result.status, installer.StepResult.WARN)
+        self.assertIn("wineboot failed", result.detail)
+
+    def test_warns_when_sync_fails(self):
+        def run(cmd, timeout=None):
+            return 1 if cmd[-1] == "sync" else 0
+
+        ctx, _lines = self._ctx(
+            which={"wineboot": "/usr/bin/wineboot",
+                   "yabridgectl": "/usr/bin/yabridgectl"},
+            run_code=run)
+        result = installer.step_prefix(ctx)
+        self.assertEqual(result.status, installer.StepResult.WARN)
+        self.assertIn("sync failed", result.detail)
+
+    def test_done_when_everything_present(self):
+        ctx, _lines = self._ctx(
+            which={"wineboot": "/usr/bin/wineboot",
+                   "yabridgectl": "/usr/bin/yabridgectl"},
+            run_code=0)
+        result = installer.step_prefix(ctx)
+        self.assertEqual(result.status, installer.StepResult.DONE)
+
+    def test_dryrun_still_done(self):
+        lines = []
+        ctx = installer.InstallContext(lines.append, dryrun=True)
+        result = installer.step_prefix(ctx)
+        self.assertEqual(result.status, installer.StepResult.DONE)
+
+
 class InstallerWindowTests(unittest.TestCase):
     def setUp(self):
         self.window = installer.InstallerWindow(dryrun=True)
@@ -195,6 +262,133 @@ class InstallerWindowTests(unittest.TestCase):
         self.assertTrue(self.window.launch_btn.isEnabled())
         self.assertIn("WinLinx Program Manager is in your app menu",
                       self.window.log_view.toPlainText())
+
+    def test_step_list_selects_nothing(self):
+        # U6: the step list is not interactive, so no row ever
+        # renders selected (v0.3 task 14).
+        self.assertEqual(
+            self.window.steps_list.selectionMode(),
+            QAbstractItemView.SelectionMode.NoSelection)
+        self.assertEqual(self.window.steps_list.selectedItems(), [])
+        # NoSelection alone leaves row 0 painted as "current".
+        self.assertEqual(self.window.steps_list.currentRow(), -1)
+
+    def test_step_list_sized_to_content(self):
+        # Six rows in a box sized for six rows, not twelve
+        # (v0.3 task 38).
+        rows = self.window.steps_list.sizeHintForRow(0)
+        expected = (rows * self.window.steps_list.count()
+                    + 2 * self.window.steps_list.frameWidth())
+        self.assertEqual(self.window.steps_list.height(), expected)
+        self.assertLess(self.window.steps_list.height(), 170)
+
+    def test_finished_with_warning_reports_warnings(self):
+        # A WARN step (e.g. step_prefix with no wineboot) makes the
+        # run report "Installed with warning(s)", not a bare
+        # "Installed!" (v0.3 task 9).
+        done = installer.StepResult(installer.StepResult.DONE)
+        warned = installer.StepResult(installer.StepResult.WARN,
+                                      "wineboot not found")
+        self.window._on_finished(([done] * 5 + [warned], False))
+        self.assertEqual(
+            self.window.statusBar().currentMessage(),
+            "Installed with 1 warning(s) - see the log")
+        self.assertTrue(self.window.launch_btn.isEnabled())
+        self.assertEqual(self.window.progress_bar.value(), 100)
+
+    def test_finished_with_failure_stops_bar_below_100(self):
+        # A failed run stops the bar at the completed fraction
+        # (v0.3 task 15).
+        done = installer.StepResult(installer.StepResult.DONE)
+        failed = installer.StepResult(installer.StepResult.FAIL,
+                                      "Wine is not installed")
+        self.window._on_finished(([done] * 5 + [failed], False))
+        self.assertEqual(self.window.progress_bar.value(), 83)
+        self.assertEqual(
+            self.window.statusBar().currentMessage(),
+            "Finished with 1 failed step(s) - see the log")
+
+
+class InstallerProgressTests(unittest.TestCase):
+    """The progress bar must move during long steps and must not hit
+    100% on a failed run (v0.3 tasks 13, 15). Fake STEPS replace the
+    real ones so timing is controllable; the real STEPS list is
+    restored in tearDown."""
+
+    def setUp(self):
+        self._orig_steps = installer.STEPS
+        self.window = None
+
+    def tearDown(self):
+        installer.STEPS = self._orig_steps
+        if self.window is not None:
+            self.window.close()
+            self.window.deleteLater()
+            _APP.processEvents()
+
+    def _run_with_steps(self, steps):
+        installer.STEPS = steps
+        self.window = installer.InstallerWindow(dryrun=True)
+        self.window.show()
+        _APP.processEvents()
+        self.window.install_btn.click()
+
+    def _wait_until_done(self, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _APP.processEvents()
+            if (self.window._worker is None
+                    and not self.window._installing):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_progress_bar_busy_during_long_step(self):
+        def slow_step(ctx):
+            time.sleep(1.5)
+            return installer.StepResult(installer.StepResult.DONE)
+
+        def quick_done(ctx):
+            return installer.StepResult(installer.StepResult.DONE)
+
+        steps = ([("step0", "First step (slow)", slow_step)]
+                 + [("step%d" % i, "Step %d" % i, quick_done)
+                    for i in range(1, 6)])
+        self._run_with_steps(steps)
+        # While step 0 runs, the bar is indeterminate (maximum 0).
+        deadline = time.time() + 10
+        saw_busy = False
+        while time.time() < deadline:
+            _APP.processEvents()
+            if "running" in self.window.steps_list.item(0).text():
+                saw_busy = self.window.progress_bar.maximum() == 0
+                break
+            time.sleep(0.05)
+        self.assertTrue(saw_busy, "bar was not busy during the step")
+        self.assertTrue(self._wait_until_done())
+        self.assertEqual(self.window.progress_bar.maximum(), 100)
+        self.assertEqual(self.window.progress_bar.value(), 100)
+
+    def test_failed_run_bar_stops_at_completed_fraction(self):
+        def failing_step(ctx):
+            return installer.StepResult(installer.StepResult.FAIL,
+                                        "Wine is not installed")
+
+        def quick_done(ctx):
+            return installer.StepResult(installer.StepResult.DONE)
+
+        steps = ([("step0", "First step (fails)", failing_step)]
+                 + [("step%d" % i, "Step %d" % i, quick_done)
+                    for i in range(1, 6)])
+        self._run_with_steps(steps)
+        self.assertTrue(self._wait_until_done())
+        self.assertEqual(self.window.progress_bar.value(), 83)
+        self.assertIn("failed",
+                      self.window.steps_list.item(0).text())
+        self.assertEqual(
+            self.window.statusBar().currentMessage(),
+            "Finished with 1 failed step(s) - see the log")
+        self.assertFalse(self.window.launch_btn.isEnabled())
 
 
 class InstallerCancelTests(unittest.TestCase):
@@ -324,7 +518,7 @@ class IconRenderTests(unittest.TestCase):
                 self.assertTrue(png.is_file())
                 self.assertGreater(png.stat().st_size, 500)
             # The window frame renders blue, not black (Qt used to
-            # paint clipPath contents — the SVG has no clipPath now).
+            # paint clipPath contents - the SVG has no clipPath now).
             from PySide6.QtGui import QImage
             image = QImage(str(out / "winlinx-256.png"))
             self.assertEqual(image.pixelColor(128, 100).name(),

@@ -184,7 +184,7 @@ class ScanPluginsTests(CommonTestBase):
 
 class VersionTests(CommonTestBase):
     def test_version_is_single_sourced(self):
-        self.assertEqual(common.__version__, "0.2.1")
+        self.assertEqual(common.__version__, "0.3")
 
     def test_parse_version(self):
         self.assertEqual(common._parse_version("v0.2"), (0, 2))
@@ -282,7 +282,7 @@ class DebugLogTests(CommonTestBase):
         self.assertIsNotNone(report)
         self.assertTrue(report.is_file())
         text = report.read_text(encoding="utf-8")
-        self.assertIn("WinLinx version: 0.2.1", text)
+        self.assertIn("WinLinx version: 0.3", text)
         self.assertNotIn("SHOULDNOTAPPEAR", text)
         self.assertNotIn(str(self.home), text)
         self.assertIn("~", text)
@@ -327,6 +327,169 @@ class FormatTests(CommonTestBase):
         (d / "b.bin").write_bytes(b"y" * 250)
         self.assertEqual(common.dir_size(d), 350)
         self.assertEqual(common.dir_size(self.home / "missing"), 0)
+
+
+class SyncPlainWordsTests(CommonTestBase):
+    """Task 5: the bridge-sync failure reason is plain words for
+    the user; the tool name lives in the log only."""
+
+    def test_sync_missing_yabridge_is_plain_words(self):
+        import unittest.mock as mock
+        with mock.patch.object(common, "find_yabridgectl",
+                               return_value=None):
+            ok, message = common.run_yabridgectl_sync()
+        self.assertFalse(ok)
+        self.assertNotIn("yabridgectl", message)
+        self.assertIn("yabridge is not installed", message)
+        self.assertIn("can't be bridged", message)
+
+    def test_sync_failure_logs_tool_name(self):
+        import unittest.mock as mock
+        with mock.patch.object(common, "find_yabridgectl",
+                               return_value=None):
+            common.run_yabridgectl_sync()
+        self.assertIn("yabridgectl",
+                      common.read_log_tail(10))
+
+    def test_plain_drop_reason(self):
+        self.assertEqual(
+            common.plain_drop_reason(
+                "bridge sync failed (yabridgectl not found)"),
+            "yabridge is not installed, so the plug-in could not "
+            "be bridged")
+        self.assertEqual(
+            common.plain_drop_reason("bridge sync failed (timeout)"),
+            "the plug-in folders could not be re-synced")
+        # Unknown reasons pass through untouched.
+        self.assertEqual(
+            common.plain_drop_reason("Wine is not installed"),
+            "Wine is not installed")
+
+
+class KillProgramTests(CommonTestBase):
+    """Task 10: Kill must not claim success when nothing ran."""
+
+    def test_kill_not_running_says_so(self):
+        ok, message = common.kill_program(
+            "/tmp/definitely-not-a-real-process-xyz.exe")
+        self.assertFalse(ok)
+        self.assertIn("is not running", message)
+
+    def test_kill_no_program(self):
+        ok, _message = common.kill_program("")
+        self.assertFalse(ok)
+
+
+class WindowsVersionOrderTests(CommonTestBase):
+    """Task 41: newest first."""
+
+    def test_versions_newest_first(self):
+        self.assertEqual(common.WINDOWS_VERSIONS,
+                         ("win11", "win10", "win8", "win7", "winxp"))
+
+
+class DroppedPluginTests(CommonTestBase):
+    """Task 21: scan_plugins records the dropped file."""
+
+    def test_dropped_file_recorded(self):
+        fakehome.build_fake_home(self.home)
+        dropped = self.home / "WinLinx" / "Plugins" / "Remix.vst3"
+        dropped.write_bytes(b"FAKEVST3")
+        plugins = common.scan_plugins()
+        by_name = {p["name"]: p for p in plugins}
+        self.assertEqual(by_name["Remix.vst3"]["dropped"], str(dropped))
+        self.assertEqual(by_name["Lonely.vst3"]["dropped"], "")
+
+
+class DebugReportExtraTests(CommonTestBase):
+    """Task 43: watcher status, counts, system info."""
+
+    def test_report_has_watcher_counts_and_system(self):
+        fakehome.build_fake_home(self.home)
+        text = common.debug_report_text()
+        self.assertIn("Watcher service:", text)
+        self.assertIn("Quarantined items: 0", text)
+        self.assertIn("Failed drops: 0", text)
+        self.assertIn("System:", text)
+        self.assertIn("Memory:", text)
+
+    def test_system_info_reads_os_and_ram(self):
+        os_name, ram = common.system_info()
+        self.assertTrue(os_name)
+        self.assertTrue(ram)
+        self.assertIn("B", ram)
+
+
+class BackupProgressBytesTests(CommonTestBase):
+    """Task 44: backup progress reports by bytes too."""
+
+    def test_progress_reports_by_bytes(self):
+        fakehome.build_fake_home(self.home)
+        big_dir = (self.home / ".wine" / "drive_c" / "Program Files"
+                   / "FooApp")
+        for i in range(3):
+            (big_dir / ("big%d.bin" % i)).write_bytes(b"X" * 1024 * 1024)
+        calls = []
+
+        def progress(done_files, done_bytes):
+            calls.append((done_files, done_bytes))
+            return True
+
+        dest = self.home / "backup.tar.gz"
+        ok, _msg = common.backup_prefixes(dest, progress=progress)
+        self.assertTrue(ok)
+        # A few huge files must still produce several progress
+        # reports (the old code reported only every 50 files).
+        self.assertGreaterEqual(len(calls), 3)
+        seen_bytes = [b for _f, b in calls]
+        self.assertEqual(seen_bytes, sorted(seen_bytes))
+        self.assertGreater(seen_bytes[-1], 3 * 1024 * 1024)
+
+
+class AsidePrefixTests(CommonTestBase):
+    """Task 37: restore names the aside copy and keeps only the
+    newest one."""
+
+    def test_restore_names_aside_location(self):
+        fakehome.build_fake_home(self.home)
+        dest = self.home / "backup.tar.gz"
+        common.backup_prefixes(dest)
+        ok, message = common.restore_prefixes(dest)
+        self.assertTrue(ok)
+        self.assertIn(".before-restore-", message)
+
+    def test_restore_prunes_old_aside_copies(self):
+        fakehome.build_fake_home(self.home)
+        dest = self.home / "backup.tar.gz"
+        common.backup_prefixes(dest)
+        old1 = self.home / ".wine.before-restore-20200101-000000"
+        old2 = self.home / ".wine.before-restore-20210101-000000"
+        old1.mkdir()
+        (old1 / "marker.txt").write_text("old")
+        old2.mkdir()
+        (old2 / "marker.txt").write_text("old")
+        ok, _message = common.restore_prefixes(dest)
+        self.assertTrue(ok)
+        self.assertFalse(old1.exists())
+        self.assertFalse(old2.exists())
+        aside = common.list_aside_prefixes()
+        self.assertEqual(len(aside), 1)
+
+    def test_prune_keeps_latest_per_prefix(self):
+        root = self.home / ".local" / "share" / "winlinx" / "prefixes"
+        root.mkdir(parents=True)
+        wine_old = self.home / ".wine.before-restore-20200101-000000"
+        wine_new = self.home / ".wine.before-restore-20210101-000000"
+        pref_old = root.parent / "prefixes.before-restore-20200101-000000"
+        pref_new = root.parent / "prefixes.before-restore-20210101-000000"
+        for d in (wine_old, wine_new, pref_old, pref_new):
+            d.mkdir()
+        removed = common.prune_aside_prefixes(keep_latest=1)
+        self.assertEqual(len(removed), 2)
+        self.assertTrue(wine_new.is_dir())
+        self.assertTrue(pref_new.is_dir())
+        self.assertFalse(wine_old.exists())
+        self.assertFalse(pref_old.exists())
 
 
 if __name__ == "__main__":

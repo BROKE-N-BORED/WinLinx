@@ -61,9 +61,9 @@ RUNNER_MIME_TYPES = (
 from PySide6.QtCore import Qt, QSettings, QThread, Signal  # noqa: E402
 from PySide6.QtGui import QIcon, QPixmap  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QVBoxLayout, QWidget,
+    QApplication, QAbstractItemView, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
 
@@ -504,8 +504,18 @@ def step_pyside6(ctx):
 
 
 def step_prefix(ctx):
-    """Wine prefix + VST folders, registered with yabridge."""
+    """Wine prefix + VST folders, registered with yabridge.
+
+    Returns WARN (not DONE) when the step skips its core work: no
+    wineboot, a failed wineboot, no yabridgectl, or a failed sync.
+    The run then reports "Installed with warning(s)" instead of a
+    bare "Installed!" for a prefix that was never created."""
     ctx.log("Setting up the Wine prefix and VST folders…")
+    if ctx.dryrun:
+        ctx.log("Dry run: would initialise the Wine prefix and "
+                "register the VST folders with yabridge")
+        return StepResult(StepResult.DONE, "dry-run")
+    warned = []
     if ctx.which("wineboot"):
         ctx.log("First Wine start takes a minute…")
         code = ctx.run(["wineboot", "--init"], timeout=300)
@@ -515,8 +525,10 @@ def step_prefix(ctx):
         else:
             ctx.log("WARNING: wineboot was slow or failed - the "
                     "prefix may still work")
+            warned.append("wineboot failed")
     else:
         ctx.log("WARNING: wineboot not found - skipping prefix setup")
+        warned.append("wineboot not found")
     vst_dirs = [
         ctx.home / ".wine" / "drive_c" / "Program Files"
         / "Common Files" / "VST3",
@@ -541,9 +553,13 @@ def step_prefix(ctx):
         else:
             ctx.log("WARNING: yabridgectl sync reported a problem - "
                     "bridging may still work; use Re-sync in WinLinx")
+            warned.append("plug-in folder sync failed")
     else:
         ctx.log("WARNING: yabridgectl not found - skipping plug-in "
                 "folder setup")
+        warned.append("yabridgectl not found")
+    if warned:
+        return StepResult(StepResult.WARN, "; ".join(warned))
     return StepResult(StepResult.DONE)
 
 
@@ -748,10 +764,21 @@ class InstallerWindow(QMainWindow):
         layout.addLayout(header)
 
         self.steps_list = QListWidget()
-        self.steps_list.setMaximumHeight(170)
+        # Not interactive: nothing is ever selectable here (U6).
+        # NoSelection alone still leaves row 0 painted as the
+        # "current" item, so clear that too and keep focus off it.
+        self.steps_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection)
+        self.steps_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         for _key, title_text, _func in STEPS:
             item = QListWidgetItem("%s - pending" % title_text)
             self.steps_list.addItem(item)
+        self.steps_list.setCurrentRow(-1)
+        # Size the list to its content: six rows, no dead space.
+        self.steps_list.setFixedHeight(
+            self.steps_list.sizeHintForRow(0)
+            * self.steps_list.count()
+            + 2 * self.steps_list.frameWidth())
         layout.addWidget(self.steps_list)
 
         self.progress_bar = QProgressBar()
@@ -805,6 +832,7 @@ class InstallerWindow(QMainWindow):
         self.cancel_btn.setEnabled(True)
         self.launch_btn.setEnabled(False)
         self.close_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         for index in range(self.steps_list.count()):
             _key, title, _func = STEPS[index]
@@ -814,7 +842,7 @@ class InstallerWindow(QMainWindow):
         self._worker = InstallWorker(dryrun=self._dryrun, parent=self)
         self._worker.log_line.connect(self._log)
         self._worker.step_status.connect(self._on_step_status)
-        self._worker.progress.connect(self.progress_bar.setValue)
+        self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
 
@@ -829,6 +857,18 @@ class InstallerWindow(QMainWindow):
         _key, title, _func = STEPS[index]
         label = STATUS_LABEL.get(status, status)
         self.steps_list.item(index).setText("%s - %s" % (title, label))
+        if status == "running…":
+            # Busy bar while a step runs: a 30-minute apt step
+            # must not sit at 0% the whole time.
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, 100)
+
+    def _on_progress(self, value):
+        # A step just finished: back to a determinate bar at the
+        # completed fraction.
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(value)
 
     def _on_finished(self, payload):
         results, cancelled = payload
@@ -838,15 +878,17 @@ class InstallerWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
         self.install_btn.setEnabled(True)
+        # Back to a determinate bar whatever state the run ended in.
+        self.progress_bar.setRange(0, 100)
+        done = len([r for r in results
+                    if r.status in (StepResult.DONE,
+                                    StepResult.WARN)])
+        total = len(STEPS)
         if cancelled:
             # A cancelled run is never "Installed!" and never 100%:
             # say plainly how far it got and how to finish it, and
             # leave Launch disabled (a half-done install must not
             # offer to launch an app that may not be there yet).
-            done = len([r for r in results
-                        if r.status in (StepResult.DONE,
-                                        StepResult.WARN)])
-            total = len(STEPS)
             self.progress_bar.setValue(int(done * 100 / total))
             self.statusBar().showMessage(
                 "Install cancelled - %d of %d steps done. Press "
@@ -857,8 +899,8 @@ class InstallerWindow(QMainWindow):
             return
         failed = [r for r in results if r.status == StepResult.FAIL]
         warned = [r for r in results if r.status == StepResult.WARN]
-        self.progress_bar.setValue(100)
         if not failed:
+            self.progress_bar.setValue(100)
             if warned:
                 self.statusBar().showMessage(
                     "Installed with %d warning(s) - see the log"
@@ -873,6 +915,9 @@ class InstallerWindow(QMainWindow):
                       ".exe/.msi anywhere.")
             self._log("WinLinx Program Manager is in your app menu.")
         else:
+            # A failed run never shows a full bar: stop at the
+            # completed fraction, so the bar agrees with the message.
+            self.progress_bar.setValue(int(done * 100 / total))
             self.statusBar().showMessage(
                 "Finished with %d failed step(s) - see the log"
                 % len(failed))

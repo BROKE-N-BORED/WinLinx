@@ -1,4 +1,4 @@
-"""Tests for winlinx/watcher.py — folder polling, scan gating,
+"""Tests for winlinx/watcher.py - folder polling, scan gating,
 Wine runs, VST bridging. Wine and clamscan are stubbed out; the
 executor records every call."""
 
@@ -22,10 +22,11 @@ import fakehome  # noqa: E402
 
 
 class StubExecutor:
-    def __init__(self):
+    def __init__(self, sync_result=(True, "")):
         self.detached = []
         self.waited = []
         self.syncs = 0
+        self.sync_result = sync_result
         self._lock = threading.Lock()
 
     def run_detached(self, cmd, env=None):
@@ -40,7 +41,7 @@ class StubExecutor:
     def sync_bridges(self):
         with self._lock:
             self.syncs += 1
-        return True, ""
+        return self.sync_result
 
 
 def _wait_for(predicate, timeout=5.0):
@@ -99,6 +100,12 @@ class WatcherTests(unittest.TestCase):
         p.start()
         self._patches.append(p)
 
+    def _stub_notify(self):
+        p = mock.patch.object(watcher.common, "notify")
+        started = p.start()
+        self._patches.append(p)
+        return started
+
     def _drop(self, folder, name, content=b"x"):
         target = folder / name
         target.write_bytes(content)
@@ -124,7 +131,10 @@ class WatcherTests(unittest.TestCase):
         self._settle()
         self.assertEqual(len(self.executor.detached), 1)
 
-    def test_unrelated_files_ignored(self):
+    def test_unrelated_files_do_not_run_but_show_as_failed(self):
+        # Unsupported drops are no longer ignored: they never run,
+        # but they are logged and recorded as failed so the manager
+        # shows them (v0.3 task 6).
         self._stub_scan()
         self._stub_wine()
         self._drop(self.programs, "notes.txt")
@@ -132,6 +142,10 @@ class WatcherTests(unittest.TestCase):
         self._settle()
         self.assertEqual(self.executor.detached, [])
         self.assertEqual(self.executor.waited, [])
+        failed = {entry["name"]: entry
+                  for entry in watcher.load_failed()}
+        self.assertEqual(set(failed), {"notes.txt", "photo.jpg"})
+        self.assertIn("WinLinx handles", failed["notes.txt"]["reason"])
 
     def test_plugin_installer_runs_then_syncs(self):
         self._stub_scan()
@@ -323,6 +337,211 @@ class WatcherTests(unittest.TestCase):
         self.w = watcher.Watcher(executor=self.executor)
         self._settle()
         self.assertEqual(len(self.executor.detached), 2)
+
+    # -- unsupported drops (v0.3 task 6) -----------------------------
+
+    def test_zip_drop_logged_and_recorded_failed(self):
+        self._stub_scan()
+        target = self._drop(self.plugins, "plugin.zip")
+        self._settle()
+        failed = watcher.load_failed()
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["name"], "plugin.zip")
+        self.assertEqual(failed[0]["reason"],
+                         watcher.UNSUPPORTED_ZIP_REASON)
+        self.assertIn("Unzip it first", failed[0]["reason"])
+        log = common.log_path().read_text(encoding="utf-8")
+        self.assertIn("Unsupported file dropped: plugin.zip", log)
+        self.assertIn("Unzip it first", log)
+
+    def test_txt_drop_reason_does_not_mention_unzipping(self):
+        self._stub_scan()
+        self._drop(self.programs, "readme.txt")
+        self._settle()
+        failed = watcher.load_failed()
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["reason"],
+                         watcher.UNSUPPORTED_REASON)
+        self.assertNotIn("Unzip", failed[0]["reason"])
+
+    def test_unsupported_file_not_scanned(self):
+        scan = self._stub_scan()
+        self._drop(self.plugins, "plugin.zip")
+        self._settle()
+        scan.assert_not_called()
+
+    def test_unsupported_file_not_retried_automatically(self):
+        self._stub_scan()
+        target = self._drop(self.plugins, "plugin.zip")
+        self._settle()
+        # Even with the retry time forced into the past, a permanent
+        # failure is not retried: retrying cannot help.
+        state = watcher._load_state()
+        self.assertTrue(state[str(target)].get("permanent"))
+        state[str(target)]["next_retry"] = 0
+        watcher._save_state(state)
+        self._settle()
+        state = watcher._load_state()
+        self.assertEqual(state[str(target)]["attempts"], 1)
+
+    # -- dropped folders (v0.3 tasks 33, 34) -------------------------
+
+    def test_dropped_folder_recorded_as_failed_drop(self):
+        self._stub_scan()
+        self._stub_wine()
+        folder = self.programs / "PortableGame"
+        folder.mkdir()
+        (folder / "game.exe").write_bytes(b"x")
+        self._settle()
+        self.assertTrue(folder.exists())
+        self.assertEqual(self.executor.detached, [])
+        failed = watcher.load_failed()
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["name"], "PortableGame")
+        self.assertEqual(failed[0]["reason"], watcher.FOLDER_REASON)
+        self.assertIn("double-click", failed[0]["reason"])
+
+    def test_folder_log_says_left_in_place_when_unscanned(self):
+        def missing_scan(path, timeout=None):
+            return {"clean": None, "threats": [],
+                    "error": "ClamAV is not installed", "missing": True}
+        p = mock.patch.object(watcher.scanner, "scan_path",
+                              side_effect=missing_scan)
+        p.start()
+        self._patches.append(p)
+        folder = self.programs / "RandomFolder"
+        folder.mkdir()
+        self._settle()
+        log = common.log_path().read_text(encoding="utf-8")
+        self.assertIn("Folder left in place: RandomFolder", log)
+        self.assertIn("UNSCANNED", log)
+        self.assertNotIn("Folder scanned clean", log)
+
+    def test_folder_log_says_scanned_clean_when_scan_ran(self):
+        self._stub_scan()
+        folder = self.programs / "ScannedFolder"
+        folder.mkdir()
+        self._settle()
+        log = common.log_path().read_text(encoding="utf-8")
+        self.assertIn("Folder scanned clean, left in place: "
+                      "ScannedFolder", log)
+
+    def test_vst3_folder_in_programs_points_at_plugins(self):
+        self._stub_scan()
+        bundle = self.programs / "Misplaced.vst3"
+        bundle.mkdir()
+        (bundle / "plugin.bin").write_bytes(b"x")
+        self._settle()
+        failed = watcher.load_failed()
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["reason"],
+                         watcher.FOLDER_VST3_IN_PROGRAMS_REASON)
+
+    # -- sync failures (v0.3 tasks 35, 32) ---------------------------
+
+    def test_sync_failure_reason_is_plain_words(self):
+        # A failed sync records a plain reason, never the tool name.
+        self._stub_scan()
+        self.executor = StubExecutor(
+            sync_result=(False, "yabridgectl not found"))
+        self.w = watcher.Watcher(executor=self.executor)
+        self._drop(self.plugins, "Chorus.vst3", b"VST3DATA")
+        self._settle()
+        failed = watcher.load_failed()
+        self.assertEqual(len(failed), 1)
+        self.assertNotIn("yabridgectl", failed[0]["reason"])
+        # Same wording the manager shows for this failure (the shared
+        # plain_drop_reason mapper): watcher, manager, and runner
+        # all say the same thing.
+        self.assertEqual(
+            failed[0]["reason"],
+            "yabridge is not installed, so the plug-in could not be "
+            "bridged")
+        log = common.log_path().read_text(encoding="utf-8")
+        self.assertNotIn("yabridgectl", log)
+
+    def test_installer_sync_failure_notifies_once(self):
+        # An installer .exe in Plugins that installs fine but fails
+        # the sync is marked installed (never re-run) AND the user is
+        # told once, with what to do (v0.3 task 35).
+        notify = self._stub_notify()
+        self._stub_scan()
+        self._stub_wine()
+        self.executor = StubExecutor(
+            sync_result=(False, "yabridgectl not found"))
+        self.w = watcher.Watcher(executor=self.executor)
+        target = self._drop(self.plugins, "synth-setup.exe")
+        self._settle()
+        self.assertEqual(self.executor.waited, [["wine", str(target)]])
+        state = watcher._load_state()
+        self.assertEqual(state[str(target)]["action"], "installed")
+        self.assertEqual(watcher.load_failed(), [])
+        notify.assert_called_once()
+        message = notify.call_args[0][1]
+        self.assertIn("synth-setup.exe installed, but the plug-in "
+                      "folders could not be re-synced", message)
+        self.assertIn("Re-sync Bridges", message)
+        self.assertNotIn("yabridgectl", message)
+        # A later pass does not notify again.
+        self._settle()
+        notify.assert_called_once()
+
+    # -- batched failure notifications (v0.3 task 32) ----------------
+
+    def test_same_reason_failures_coalesce(self):
+        notify = self._stub_notify()
+        self._stub_scan()
+        self._stub_wine(present=False)
+        self._drop(self.programs, "one.exe")
+        self._drop(self.programs, "two.exe")
+        self._drop(self.programs, "three.exe")
+        self._settle()
+        self.w._flush_failure_notifications()
+        notify.assert_called_once_with(
+            "WinLinx",
+            "3 files could not be handled: Wine is not installed - "
+            "see the WinLinx Program Manager.")
+
+    def test_single_failure_notification_names_the_file(self):
+        notify = self._stub_notify()
+        self._stub_scan()
+        self._stub_wine(present=False)
+        self._drop(self.programs, "game.exe")
+        self._settle()
+        self.w._flush_failure_notifications()
+        notify.assert_called_once_with(
+            "WinLinx",
+            "game.exe could not be handled: Wine is not installed - "
+            "see the WinLinx Program Manager.")
+
+    def test_different_reasons_notify_separately(self):
+        notify = self._stub_notify()
+        self._stub_scan()
+        self._stub_wine(present=False)
+        self._drop(self.programs, "game.exe")
+        self._drop(self.plugins, "plugin.zip")
+        self._settle()
+        self.w._flush_failure_notifications()
+        self.assertEqual(notify.call_count, 2)
+        messages = [call[0][1] for call in notify.call_args_list]
+        self.assertTrue(any("game.exe could not be handled" in m
+                            for m in messages))
+        self.assertTrue(any("plugin.zip could not be handled" in m
+                            for m in messages))
+
+    def test_next_scan_flushes_failure_notifications(self):
+        notify = self._stub_notify()
+        self._stub_scan()
+        self._stub_wine(present=False)
+        self._drop(self.programs, "game.exe")
+        self._settle()
+        # Held back for batching: nothing sent yet.
+        notify.assert_not_called()
+        # The next scan pass sends it.
+        self.w.scan_once()
+        notify.assert_called_once()
+        self.assertIn("game.exe could not be handled",
+                      notify.call_args[0][1])
 
 
 if __name__ == "__main__":

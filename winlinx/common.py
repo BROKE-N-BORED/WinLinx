@@ -25,7 +25,7 @@ from pathlib import Path
 
 # Single source of truth for the WinLinx version. Every other file
 # imports this (Python) or reads it out of this file (shell scripts).
-__version__ = "0.2.1"
+__version__ = "0.3"
 
 UPDATE_API_URL = ("https://api.github.com/repos/BROKE-N-BORED/"
                   "WinLinx/releases/latest")
@@ -244,6 +244,50 @@ def scrub_text(text):
     return _SECRET_RE.sub(r"\1=<redacted>", out)
 
 
+def watcher_service_status():
+    """The user watcher service state ("active", "inactive",
+    "failed", "unknown"). Never raises."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active",
+             "winlinx-watcher.service"],
+            capture_output=True, text=True, timeout=10)
+        state = (proc.stdout or "").strip()
+        return state if state else "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
+def system_info():
+    """(os description, total RAM) from /etc/os-release and
+    /proc/meminfo. Either element is "" when it cannot be read."""
+    os_name = ""
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as fh:
+            fields = {}
+            for line in fh:
+                if "=" in line:
+                    key, value = line.strip().split("=", 1)
+                    fields[key] = value.strip().strip('"')
+        os_name = fields.get("PRETTY_NAME") or (
+            "%s %s" % (fields.get("NAME", ""),
+                       fields.get("VERSION", ""))).strip()
+    except OSError:
+        pass
+    ram = ""
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        ram = format_size(int(parts[1]) * 1024)
+                    break
+    except (OSError, ValueError):
+        pass
+    return os_name, ram
+
+
 def debug_report_text():
     """The scrubbed debug report (U12): versions, status, and the
     last 200 log lines across the current and rotated logs."""
@@ -264,6 +308,19 @@ def debug_report_text():
                     if prefix.is_dir() else "missing"))
     lines.append("Per-program prefixes: %d"
                  % len(load_prefix_map()))
+    lines.append("Watcher service: %s" % watcher_service_status())
+    lines.append("Quarantined items: %d"
+                 % len(scanner.load_quarantine()))
+    try:
+        import watcher  # local import: watcher imports common
+        failed_count = len(watcher.load_failed())
+    except Exception:  # noqa: BLE001 - a broken state file must not
+        failed_count = -1  # break the report
+    lines.append("Failed drops: %d" % failed_count
+                 if failed_count >= 0 else "Failed drops: unknown")
+    os_name, ram = system_info()
+    lines.append("System: %s" % (os_name or "unknown"))
+    lines.append("Memory: %s" % (ram or "unknown"))
     lines.append("")
     lines.append("Recent log (last 200 lines):")
     gathered = []
@@ -329,21 +386,26 @@ def is_running(exe_path):
 
 def kill_program(exe_path):
     """Kill processes running this program's .exe. Returns
-    (ok, message). Never raises."""
+    (ok, message). Never raises. When nothing is running, that is
+    reported, not claimed as a successful kill."""
     if not exe_path:
         return False, "no program to kill"
+    name = Path(exe_path).name
+    if shutil.which("pgrep") and not is_running(exe_path):
+        return False, "%s is not running" % name
     pkill = shutil.which("pkill")
     if not pkill:
         return False, "pkill is not installed"
-    name = Path(exe_path).name
     try:
         proc = subprocess.run([pkill, "-f", name],
                               capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
-    if proc.returncode in (0, 1):  # 1 = no process matched
+    if proc.returncode == 0:
         return True, ""
-    return False, "pkill exited with code %d" % proc.returncode
+    if proc.returncode == 1:  # nothing matched after all (raced exit)
+        return False, "%s is not running" % name
+    return False, "could not stop %s" % name
 
 
 # ---------------------------------------------------------------- windows paths
@@ -445,19 +507,46 @@ def get_yabridge_status():
 
 
 def run_yabridgectl_sync(timeout=180):
-    """Run `yabridgectl sync`. Returns (ok, message)."""
+    """Run `yabridgectl sync`. Returns (ok, message).
+
+    The message is plain words for the user: it never names the
+    tool, because the manager, the Failed Drops list, and the
+    watcher notification all show it as-is. The technical detail
+    goes in the log only."""
     ctl = find_yabridgectl()
     if not ctl:
-        return False, "yabridgectl not found"
+        append_log("WARNING: bridge sync failed (yabridgectl not found)")
+        return False, ("yabridge is not installed, so plug-ins can't "
+                       "be bridged")
     try:
         proc = subprocess.run([ctl, "sync"], capture_output=True,
                               text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc)
+        append_log("WARNING: bridge sync failed: %s" % exc)
+        return False, "the plug-in folders could not be re-synced"
     if proc.returncode == 0:
         return True, (proc.stdout or "").strip()
     err = (proc.stderr or proc.stdout or "").strip()
-    return False, err or ("exit code %d" % proc.returncode)
+    append_log("WARNING: bridge sync failed (exit code %d): %s"
+               % (proc.returncode, err))
+    return False, "the plug-in folders could not be re-synced"
+
+
+def plain_drop_reason(reason):
+    """Plain-words version of a failed-drop reason for display.
+
+    Older handled.json entries (and the watcher's own wording) can
+    still carry the technical form "bridge sync failed
+    (yabridgectl not found)"; the user sees the plain form instead.
+    Unknown reasons pass through untouched."""
+    text = reason or ""
+    low = text.lower()
+    if "yabridgectl" in low or "yabridge is not installed" in low:
+        return ("yabridge is not installed, so the plug-in could not "
+                "be bridged")
+    if "bridge sync failed" in low:
+        return "the plug-in folders could not be re-synced"
+    return text
 
 
 # ---------------------------------------------------------------- registry
@@ -908,6 +997,7 @@ def scan_plugins():
                 "wrapper": str(wrapper),
             })
     # Windows plugin files with no wrapper yet.
+    dropped_folder = plugins_folder()
     for kind, folders, suffixes in (
         ("VST3", (vst3_dir(), vst3_dir_x86()), (".vst3",)),
         ("VST2", (vst2_dir(),), (".dll",)),
@@ -932,13 +1022,18 @@ def scan_plugins():
                     "source": str(entry),
                     "wrapper": "",
                 })
+    # The file the user actually dropped, when it is still in
+    # ~/WinLinx/Plugins: that is the "Source File" the UI shows.
+    for plug in plugins:
+        dropped = dropped_folder / plug["name"]
+        plug["dropped"] = str(dropped) if dropped.exists() else ""
     plugins.sort(key=lambda p: (p["name"].lower(), p["kind"]))
     return plugins
 
 
 # ---------------------------------------------------------------- per-program prefixes
 
-WINDOWS_VERSIONS = ("win10", "win11", "win7", "winxp", "win8")
+WINDOWS_VERSIONS = ("win11", "win10", "win8", "win7", "winxp")
 WINDOWS_VERSION_LABELS = {
     "win10": "Windows 10",
     "win11": "Windows 11",
@@ -1031,7 +1126,9 @@ def ensure_program_prefix(exe_path, timeout=300):
         try:
             dest.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            return False, str(exc)
+            append_log("WARNING: could not create prefix folder %s: %s"
+                       % (dest, exc))
+            return False, "the new prefix folder could not be created"
     env = dict(os.environ)
     env["WINEPREFIX"] = str(dest)
     try:
@@ -1039,9 +1136,11 @@ def ensure_program_prefix(exe_path, timeout=300):
                               capture_output=True, text=True,
                               timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc)
+        append_log("WARNING: could not create prefix for %s: %s"
+                   % (exe_path, exc))
+        return False, "Wine could not start the new prefix"
     if proc.returncode != 0:
-        return False, "wineboot exited with code %d" % proc.returncode
+        return False, "Wine could not start the new prefix"
     set_program_prefix(exe_path, dest)
     return True, str(dest)
 
@@ -1088,9 +1187,11 @@ def set_program_windows_version(exe_path, version):
                               env=env, capture_output=True, text=True,
                               timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc)
+        append_log("WARNING: could not set Windows version for %s: %s"
+                   % (exe_path, exc))
+        return False, "the Windows version could not be set"
     if proc.returncode != 0:
-        return False, "winecfg exited with code %d" % proc.returncode
+        return False, "the Windows version could not be set"
     key = _exe_key(exe_path)
     settings = load_program_settings()
     entry = settings.get(key) if isinstance(settings.get(key), dict) \
@@ -1122,6 +1223,9 @@ def backup_prefixes(dest_path, progress=None):
         return False, str(exc)
     done_files, done_bytes = 0, 0
     cancelled = False
+    # Report progress by bytes as well as files: a backup of a few
+    # huge files would otherwise show nothing until file 50.
+    last_report_bytes = 0
     try:
         with tarfile.open(dest, "w:gz") as tf:
             for source, arcbase in sources:
@@ -1137,7 +1241,11 @@ def backup_prefixes(dest_path, progress=None):
                             done_bytes += full.stat().st_size
                         except (OSError, tarfile.TarError):
                             continue
-                        if progress and done_files % 50 == 0:
+                        if progress and (
+                                done_files % 50 == 0
+                                or done_bytes - last_report_bytes
+                                >= 1024 * 1024):
+                            last_report_bytes = done_bytes
                             if progress(done_files, done_bytes) is False:
                                 cancelled = True
                                 break
@@ -1160,6 +1268,47 @@ def backup_prefixes(dest_path, progress=None):
     if progress:
         progress(done_files, done_bytes)
     return True, "%d files, %s" % (done_files, format_size(done_bytes))
+
+
+def list_aside_prefixes():
+    """Every ".before-restore-<stamp>" prefix copy left by earlier
+    restores, newest first (by name, which carries the stamp)."""
+    aside = []
+    for target in (wine_prefix(), prefixes_root()):
+        parent = target.parent
+        try:
+            entries = list(parent.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name.startswith(target.name + ".before-restore-"):
+                aside.append(entry)
+    aside.sort(key=lambda p: p.name, reverse=True)
+    return aside
+
+
+def prune_aside_prefixes(keep_latest=1):
+    """Remove old aside prefix copies, keeping the newest
+    keep_latest per prefix (the shared prefix and the per-program
+    prefixes each keep their own latest). Returns the list of
+    removed paths. Never raises."""
+    aside = list_aside_prefixes()
+    groups = {}
+    for entry in aside:
+        base = entry.name.split(".before-restore-")[0]
+        groups.setdefault(base, []).append(entry)
+    removed = []
+    for entries in groups.values():
+        for entry in entries[keep_latest:]:
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+                removed.append(entry)
+            except OSError:
+                continue
+    return removed
 
 
 def restore_prefixes(archive_path, progress=None):
@@ -1227,7 +1376,19 @@ still on disk with .before-restore-%s in its name)" % (exc, stamp)
                        "name)" % (done, stamp))
     if progress:
         progress(done, 0)
-    return True, "%d files restored" % done
+    # Repeated restores used to pile up full prefix duplicates; keep
+    # only the newest aside copy.
+    pruned = prune_aside_prefixes(keep_latest=1)
+    message = "%d files restored" % done
+    if moved_aside:
+        message += (". The old prefix was moved aside to %s"
+                    % ", ".join(str(aside) for _target, aside
+                                in moved_aside))
+    if pruned:
+        message += (" (%d older aside %s removed)"
+                    % (len(pruned),
+                       "copy was" if len(pruned) == 1 else "copies were"))
+    return True, message
 
 
 # ---------------------------------------------------------------- self-update check

@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -20,9 +21,12 @@ import fakehome  # noqa: E402
 import scanner  # noqa: E402
 
 from PySide6.QtCore import Qt, QTimer  # noqa: E402
+from PySide6.QtGui import QIcon  # noqa: E402
 from PySide6.QtNetwork import QLocalSocket  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication, QDialog, QMessageBox, QPushButton, QWidget,
+)
 import manager  # noqa: E402
 
 _APP = None
@@ -114,7 +118,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(table.item(row, 2).text(), "1.0 MB")
         # Running + Prefix columns.
         self.assertEqual(table.item(row, 4).text(), "Not running")
-        self.assertEqual(table.item(row, 5).text(), "Shared")
+        self.assertEqual(table.item(row, 5).text(), "Shared prefix")
 
     def test_plugins_table_populated(self):
         table = self.window.plugins_table
@@ -223,6 +227,549 @@ class ManagerTests(unittest.TestCase):
         finally:
             dialog.close()
 
+    # -- v0.3 regression tests ------------------------------------
+
+    def _wait_until(self, predicate, timeout=20.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _APP.processEvents()
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return predicate()
+
+    def _select_row(self, table, row=0):
+        table.selectRow(row)
+        _APP.processEvents()
+
+    def test_launch_without_wine_is_plain_words(self):
+        # Task 4: no raw "[Errno 2] ... 'wine'" in the dialog, and
+        # no stale "Select a program first" left in the status bar.
+        self._select_row(self.window.programs_table)
+        seen = []
+        with mock.patch.object(manager.common, "find_wine",
+                               return_value=None):
+            with mock.patch.object(
+                    QMessageBox, "warning",
+                    lambda *args: seen.append(args[2])):
+                self.window._launch_selected()
+        self.assertEqual(len(seen), 1)
+        self.assertIn("Wine is not installed", seen[0])
+        self.assertIn("cannot run", seen[0])
+        self.assertNotIn("Errno", seen[0])
+        self.assertNotIn("'wine'", seen[0])
+        status = self.window.statusBar().currentMessage()
+        self.assertIn("Could not launch", status)
+        self.assertNotIn("Select a program first", status)
+
+    def test_resync_failure_is_plain_words(self):
+        # Task 5: no `yabridgectl` in the dialog.
+        seen = []
+        with mock.patch.object(
+                QMessageBox, "warning",
+                lambda *args: seen.append(args[2])):
+            self.window._resync()
+            self.assertTrue(self._wait_until(lambda: seen))
+        self.assertIn("yabridge is not installed", seen[0])
+        self.assertNotIn("yabridgectl", seen[0])
+        self._wait_for_refresh()
+
+    def test_failed_reason_plain_words(self):
+        # Task 5: an old-style Failed Drops reason is shown plain.
+        failed_path = (self.home / "WinLinx" / "Plugins"
+                       / "BigSynth.vst3")
+        state = {str(failed_path): {
+            "size": 1, "mtime": 1, "action": "failed",
+            "reason": "bridge sync failed (yabridgectl not found)",
+            "attempts": 1, "next_retry": 0,
+            "time": "2026-11-16T11:30:00"}}
+        (self.home / ".local" / "share" / "winlinx"
+         / "handled.json").write_text(json.dumps(state))
+        self.window.refresh()
+        self._wait_for_refresh()
+        table = self.window.failed_table
+        self.assertEqual(table.rowCount(), 1)
+        reason = table.item(0, 1).text()
+        self.assertNotIn("yabridgectl", reason)
+        self.assertIn("yabridge is not installed", reason)
+
+    def test_action_messages_survive_refresh(self):
+        # Task 7: Delete, Retry and Forget confirmations are still
+        # in the status bar after the refresh finishes.
+        with mock.patch.object(manager, "confirm_destructive",
+                               return_value=True):
+            self._select_row(self.window.quarantine_table)
+            self.window._delete_quarantined()
+            self._wait_for_refresh()
+            self.assertEqual(
+                self.window.statusBar().currentMessage(),
+                "Deleted nasty.exe")
+            self._select_row(self.window.failed_table)
+            self.window._retry_failed()
+            self._wait_for_refresh()
+            self.assertIn(
+                "Retrying broken.exe",
+                self.window.statusBar().currentMessage())
+            # Retry cleared the entry; put it back for Forget.
+            failed_path = (self.home / "WinLinx" / "Programs"
+                           / "broken.exe")
+            state = {str(failed_path): {
+                "size": 1, "mtime": 1, "action": "failed",
+                "reason": "Wine is not installed", "attempts": 2,
+                "next_retry": 0, "time": "2026-11-12T09:04:00"}}
+            (self.home / ".local" / "share" / "winlinx"
+             / "handled.json").write_text(json.dumps(state))
+            self.window.refresh()
+            self._wait_for_refresh()
+            self._select_row(self.window.failed_table)
+            self.window._forget_failed()
+            self._wait_for_refresh()
+            self.assertEqual(
+                self.window.statusBar().currentMessage(),
+                "Forgot broken.exe")
+
+    def test_action_buttons_need_selection(self):
+        # Task 17: with nothing selected the row actions are
+        # disabled; selecting a row enables them.
+        window = self.window
+        for btn in (window.launch_btn, window.uninstall_btn,
+                    window.open_folder_btn, window.remove_plugin_btn,
+                    window.allow_btn, window.delete_btn,
+                    window.retry_btn, window.forget_btn):
+            self.assertFalse(btn.isEnabled(), btn.text())
+        self.assertTrue(window.install_program_btn.isEnabled())
+        self.assertTrue(window.programs_refresh_btn.isEnabled())
+        self._select_row(window.programs_table)
+        self.assertTrue(window.launch_btn.isEnabled())
+        self.assertTrue(window.uninstall_btn.isEnabled())
+        self.assertTrue(window.open_folder_btn.isEnabled())
+        self.assertFalse(window.allow_btn.isEnabled())
+        self._select_row(window.plugins_table)
+        self.assertTrue(window.remove_plugin_btn.isEnabled())
+        self._select_row(window.quarantine_table)
+        self.assertTrue(window.allow_btn.isEnabled())
+        self.assertTrue(window.delete_btn.isEnabled())
+        self._select_row(window.failed_table)
+        self.assertTrue(window.retry_btn.isEnabled())
+        self.assertTrue(window.forget_btn.isEnabled())
+
+    def test_program_icons_are_per_program_glyphs(self):
+        # Task 18: no more identical app icon on every row.
+        icon_a = manager.make_program_icon("Alpha")
+        icon_b = manager.make_program_icon("Beta")
+        self.assertFalse(icon_a.isNull())
+        self.assertFalse(icon_b.isNull())
+        img_a = icon_a.pixmap(48, 48).toImage()
+        img_b = icon_b.pixmap(48, 48).toImage()
+        self.assertNotEqual(img_a, img_b)
+        table = self.window.programs_table
+        app_key = QIcon(str(manager.ICON_PATH)).cacheKey()
+        for row in range(table.rowCount()):
+            item_icon = table.item(row, 0).icon()
+            self.assertFalse(item_icon.isNull())
+            self.assertNotEqual(item_icon.cacheKey(), app_key)
+
+    def test_prefix_column_explains_itself(self):
+        # Task 19: "Own prefix" / "Shared prefix", with a tooltip
+        # pointing at the How to Use topic.
+        table = self.window.programs_table
+        item = table.item(0, 5)
+        self.assertIn("prefix", item.text())
+        self.assertIn("How to Use", item.toolTip())
+
+    def test_plugins_hint_and_status_tooltips(self):
+        # Task 20: the Plug-ins tab says what to do about
+        # "Not bridged".
+        self.assertIn("Re-sync Bridges",
+                      self.window.plugins_hint_label.text())
+        table = self.window.plugins_table
+        tips = {table.item(r, 0).text(): table.item(r, 2).toolTip()
+                for r in range(table.rowCount())}
+        self.assertIn("Re-sync Bridges", tips["Lonely.vst3"])
+        self.assertIn("gone", tips["Broken.vst3"])
+        self.assertIn("DAW", tips["Remix.vst3"])
+
+    def test_source_file_shows_dropped_file(self):
+        # Task 21: when the dropped file is still in
+        # ~/WinLinx/Plugins, that path is what the column shows.
+        dropped = self.home / "WinLinx" / "Plugins" / "Remix.vst3"
+        dropped.write_bytes(b"FAKEVST3")
+        self.window.refresh()
+        self._wait_for_refresh()
+        table = self.window.plugins_table
+        row = next(r for r in range(table.rowCount())
+                   if table.item(r, 0).text() == "Remix.vst3")
+        shown = table.item(row, 3).text()
+        self.assertIn("WinLinx/Plugins", shown)
+        self.assertIn("Remix.vst3", shown)
+        self.assertIn("Installed copy",
+                      table.item(row, 3).toolTip())
+
+    def test_activity_warnings_filter(self):
+        # Task 22: WARNING/ERROR lines are highlighted, and the
+        # warnings-only filter hides the routine lines.
+        self.assertIsNotNone(self.window._activity_highlighter)
+        log = self.home / ".local" / "share" / "winlinx" / "layer.log"
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write("[2026-11-16 12:00:00] WARNING: something odd\n")
+            fh.write("[2026-11-16 12:01:00] ERROR: something broke\n")
+            fh.write("[2026-11-16 12:02:00] routine line\n")
+        self.window._poll_activity(force=True)
+        full = self.window.activity_view.toPlainText()
+        self.assertIn("routine line", full)
+        self.window.activity_warnings_only.setChecked(True)
+        filtered = self.window.activity_view.toPlainText()
+        self.assertIn("something odd", filtered)
+        self.assertIn("something broke", filtered)
+        self.assertNotIn("routine line", filtered)
+        self.window.activity_warnings_only.setChecked(False)
+        self.assertIn("routine line",
+                      self.window.activity_view.toPlainText())
+
+    def test_system_tab_repair_button_and_no_duplicates(self):
+        # Tasks 23 + 31: one Install/Repair action; Re-sync Bridges,
+        # Check for Updates and Debug Report no longer duplicated
+        # on the System tab.
+        self.assertIn("Install or Repair",
+                      self.window.repair_btn.text())
+        for attr in ("resync2_btn", "updates_btn", "debug_btn"):
+            self.assertFalse(hasattr(self.window, attr), attr)
+        hint = self.window.watcher_hint_label.text()
+        self.assertIn("Watcher", hint)
+
+    def test_quarantine_search_covers_threats(self):
+        # Task 24: searching a threat name finds the row; a
+        # no-match search says so and the status bar reflects it.
+        table = self.window.quarantine_table
+        self.window.quarantine_search_box.setText("evil")
+        visible = [r for r in range(table.rowCount())
+                   if not table.isRowHidden(r)]
+        self.assertEqual(len(visible), 1)
+        self.window.quarantine_search_box.setText("zzz-no-match")
+        visible = [r for r in range(table.rowCount())
+                   if not table.isRowHidden(r)]
+        self.assertEqual(len(visible), 0)
+        self.window.tabs.setCurrentIndex(2)
+        _APP.processEvents()
+        self.assertTrue(
+            self.window.quarantine_nomatch_label.isVisible())
+        self.assertIn("zzz-no-match",
+                      self.window.quarantine_nomatch_label.text())
+        self.assertIn(
+            "Showing 0 of 1",
+            self.window.statusBar().currentMessage())
+        self.window.quarantine_search_box.setText("")
+        self.assertFalse(
+            self.window.quarantine_nomatch_label.isVisible())
+
+    def test_forget_needs_confirmation(self):
+        # Task 25: Forget asks first; No leaves the drop alone.
+        import watcher
+        self._select_row(self.window.failed_table)
+        with mock.patch.object(manager, "confirm_destructive",
+                               return_value=False):
+            self.window._forget_failed()
+        self.assertEqual(len(watcher.load_failed()), 1)
+        with mock.patch.object(manager, "confirm_destructive",
+                               return_value=True):
+            self.window._forget_failed()
+            self._wait_for_refresh()
+        self.assertEqual(len(watcher.load_failed()), 0)
+
+    def test_cant_uninstall_offers_open_folder(self):
+        # Task 26: the dialog has an Open Install Folder button,
+        # and pressing it opens the folder.
+        opened = []
+        captured = {}
+
+        def fake_exec(box):
+            captured["box"] = box
+            buttons = [b for b in box.buttons()
+                       if b.text() == "Open Install Folder"]
+            captured["has_button"] = bool(buttons)
+            if buttons:
+                buttons[0].click()
+            return QDialog.DialogCode.Rejected
+
+        row = next(r for r in range(self.window.programs_table.rowCount())
+                   if self.window.programs_table.item(r, 0).text()
+                   == "FooApp 2.0")
+        self._select_row(self.window.programs_table, row)
+        with mock.patch.object(manager.common, "uninstall_command",
+                               return_value=None):
+            with mock.patch.object(QMessageBox, "exec", fake_exec):
+                with mock.patch.object(
+                        self.window, "_open_path",
+                        lambda path: opened.append(str(path))):
+                    self.window._uninstall_selected()
+        self.assertTrue(captured.get("has_button"))
+        self.assertEqual(len(opened), 1)
+        self.assertIn("FooApp", opened[0])
+
+    def test_howto_dialog_has_close_button(self):
+        # Task 27: the How to Use dialog has a real Close button.
+        dialog = manager.HowToUseDialog(self.window)
+        try:
+            buttons = [b.text() for b in
+                       dialog.findChildren(QPushButton)]
+            self.assertIn("Close", buttons)
+        finally:
+            dialog.close()
+
+    def test_scan_picker_has_cancel_button(self):
+        # Task 27: the scan picker has a Cancel button.
+        captured = {}
+
+        def fake_exec(dialog):
+            captured["dialog"] = dialog
+            return QDialog.DialogCode.Rejected
+
+        with mock.patch.object(QDialog, "exec", fake_exec):
+            self.window._scan_picker()
+        buttons = [b.text() for b in
+                   captured["dialog"].findChildren(QPushButton)]
+        self.assertIn("Cancel", buttons)
+
+    def test_threats_text_shows_file_once(self):
+        # Task 28: the file once, threat names deduplicated.
+        text = manager.format_threats_text(
+            "/tmp/x/file.exe",
+            [("/tmp/x/file.exe", "Trojan.A"),
+             ("/tmp/x/file.exe", "Trojan.A"),
+             ("/tmp/x/other.dll", "Worm.B")])
+        self.assertEqual(text.count("/tmp/x/file.exe"), 1)
+        self.assertEqual(text.count("Trojan.A"), 1)
+        self.assertIn("Worm.B", text)
+
+    def test_uninstall_dialog_safe_button_default(self):
+        # Task 29: Cancel, not Uninstall, is the default button.
+        dialog = manager.UninstallDialog(self.window)
+        try:
+            self.assertTrue(dialog.cancel_btn.isDefault())
+            self.assertFalse(dialog.uninstall_btn.isDefault())
+        finally:
+            dialog.close()
+
+    def test_update_signatures_without_clamav(self):
+        # Task 11: with no ClamAV, Update Signatures says so and
+        # offers the install instead of freshclam commands.
+        captured = {}
+        installed = []
+
+        def fake_exec(box):
+            captured["box"] = box
+            buttons = [b for b in box.buttons()
+                       if b.text() == "Install ClamAV"]
+            captured["has_install"] = bool(buttons)
+            if buttons:
+                buttons[0].click()
+            return QDialog.DialogCode.Rejected
+
+        with mock.patch.object(QMessageBox, "exec", fake_exec):
+            with mock.patch.object(
+                    self.window, "_install_clamav",
+                    lambda: installed.append(True)):
+                self.window._update_signatures()
+        self.assertIn("isn't installed", captured["box"].text())
+        self.assertTrue(captured.get("has_install"))
+        self.assertEqual(installed, [True])
+
+    def test_pkexec_missing_explains_itself(self):
+        # Task 30: the terminal fallback says why it is needed.
+        seen = []
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch.object(
+                    QMessageBox, "information",
+                    lambda *args: seen.append(args[2])):
+                self.window._install_clamav()
+                self.assertIn("password prompt", seen[-1])
+                self.assertIn("terminal", seen[-1])
+            with mock.patch.object(
+                    manager.scanner, "find_clamscan",
+                    return_value="/usr/bin/clamscan"):
+                with mock.patch.object(
+                        QMessageBox, "information",
+                        lambda *args: seen.append(args[2])):
+                    self.window._update_signatures()
+                    self.assertIn("password prompt", seen[-1])
+                    self.assertIn("terminal", seen[-1])
+
+    def test_check_updates_in_help_menu_only(self):
+        # Task 31: File menu and System tab no longer carry it.
+        menus = {action.text(): action.menu()
+                 for action in self.window.menuBar().actions()}
+        file_texts = [a.text() for a in
+                      menus["File"].actions()]
+        help_texts = [a.text() for a in
+                      menus["Help"].actions()]
+        self.assertNotIn("Check for Updates", file_texts)
+        self.assertEqual(help_texts.count("Check for Updates"), 1)
+        self.assertFalse(hasattr(self.window, "updates_btn"))
+
+    def test_check_updates_failure_is_plain_words(self):
+        # Task 42: no raw "Could not reach GitHub: ..." text.
+        seen = []
+        result = {"available": False, "latest": "", "url": "",
+                  "zip_url": "", "error": "boom 123"}
+        with mock.patch.object(manager.common, "check_for_update",
+                               return_value=result):
+            with mock.patch.object(
+                    QMessageBox, "warning",
+                    lambda *args: seen.append(args[2])):
+                self.window._check_updates()
+                self.assertTrue(self._wait_until(lambda: seen))
+        self.assertNotIn("boom", seen[0])
+        self.assertNotIn("GitHub", seen[0])
+        self.assertIn("internet", seen[0])
+        self._wait_for_refresh()
+
+    def test_clamav_install_failure_is_plain_words(self):
+        # Task 42: no "exit code %s" in the failure dialog.
+        import types
+        seen = []
+        fake_proc = types.SimpleNamespace(returncode=1, stdout="",
+                                          stderr="")
+        with mock.patch("shutil.which",
+                        return_value="/usr/bin/pkexec"):
+            with mock.patch("subprocess.run",
+                            return_value=fake_proc):
+                with mock.patch.object(
+                        QMessageBox, "warning",
+                        lambda *args: seen.append(args[2])):
+                    self.window._install_clamav()
+                    self.assertTrue(self._wait_until(lambda: seen))
+        self.assertNotIn("exit code", seen[0])
+        self.assertIn("could not be installed", seen[0])
+        self._wait_for_refresh()
+
+    def test_kill_not_running_says_so(self):
+        # Task 10: Kill on a program that is not running says so
+        # instead of claiming "Stopped".
+        self._select_row(self.window.programs_table)
+        warned = []
+        with mock.patch.object(manager, "confirm_destructive",
+                               return_value=True):
+            with mock.patch.object(
+                    QMessageBox, "warning",
+                    lambda *args: warned.append(args[2])):
+                self.window._kill_selected()
+                self._wait_for_refresh()
+        self.assertEqual(warned, [])
+        self.assertIn("is not running",
+                      self.window.statusBar().currentMessage())
+
+    def test_column_widths_and_middle_elision(self):
+        # Task 16: wider defaults where the content was cut off,
+        # paths elided in the middle, full text in tooltips.
+        failed = self.window.failed_table
+        self.assertGreaterEqual(failed.columnWidth(1), 200)
+        self.assertGreaterEqual(failed.columnWidth(3), 130)
+        quarantine = self.window.quarantine_table
+        self.assertGreaterEqual(quarantine.columnWidth(1), 150)
+        for table in (self.window.programs_table,
+                      self.window.plugins_table,
+                      self.window.quarantine_table,
+                      self.window.failed_table):
+            self.assertEqual(table.textElideMode(),
+                             Qt.TextElideMode.ElideMiddle)
+        location = None
+        for r in range(self.window.programs_table.rowCount()):
+            if (self.window.programs_table.item(r, 0).text()
+                    == "FooApp 2.0"):
+                location = self.window.programs_table.item(r, 3)
+        self.assertIsNotNone(location)
+        self.assertEqual(location.toolTip(), location.text())
+        self.assertIn("FooApp", location.text())
+
+    def test_middle_elide_delegate_keeps_filename(self):
+        # Task 16: the delegate elides paths in the middle, so the
+        # filename stays visible (QTableWidget's own textElideMode
+        # does not take effect in this Qt build).
+        from PySide6.QtCore import QRect
+        from PySide6.QtWidgets import QStyleOptionViewItem
+        table = self.window.programs_table
+        row = next(r for r in range(table.rowCount())
+                   if table.item(r, 0).text() == "FooApp 2.0")
+        delegate = manager.MiddleElideDelegate(table)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 200, 30)
+        delegate.initStyleOption(option, table.model().index(row, 3))
+        self.assertIn("FooApp", option.text)
+        self.assertIn("…", option.text)
+
+
+class EmptyHomeTests(unittest.TestCase):
+    """The manager on a fresh home: empty-state guidance, hidden
+    zero counts, and "No prefix yet" (tasks 8, 39, 40)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_home = os.environ.get("WINLINX_HOME")
+        os.environ["WINLINX_HOME"] = self._tmp.name
+        self.home = Path(self._tmp.name)
+        (self.home / "WinLinx" / "Programs").mkdir(parents=True)
+        (self.home / "WinLinx" / "Plugins").mkdir(parents=True)
+        (self.home / ".local" / "share" / "winlinx").mkdir(parents=True)
+        self.window = manager.ManagerWindow()
+        self.window.show()
+        self._wait_for_refresh()
+
+    def tearDown(self):
+        self.window.close()
+        self.window.deleteLater()
+        _APP.processEvents()
+        if self._old_home is None:
+            os.environ.pop("WINLINX_HOME", None)
+        else:
+            os.environ["WINLINX_HOME"] = self._old_home
+        self._tmp.cleanup()
+
+    def _wait_for_refresh(self, timeout=20.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _APP.processEvents()
+            if self.window._worker is None:
+                return True
+            time.sleep(0.05)
+        return self.window._worker is None
+
+    def test_empty_state_guidance(self):
+        # Task 8: fresh home says what to do next.
+        self.assertEqual(self.window.programs_table.rowCount(), 0)
+        self.assertEqual(self.window.plugins_table.rowCount(), 0)
+        self.assertTrue(
+            self.window.programs_empty_label.isVisible())
+        self.assertIn("No programs yet",
+                      self.window.programs_empty_label.text())
+        self.assertIn("Install Program",
+                      self.window.programs_empty_label.text())
+        self.assertIn("F1", self.window.programs_empty_label.text())
+        self.window.tabs.setCurrentIndex(1)
+        _APP.processEvents()
+        self.assertTrue(self.window.plugins_empty_label.isVisible())
+        self.assertIn("No plug-ins yet",
+                      self.window.plugins_empty_label.text())
+        self.assertIn("F1", self.window.plugins_empty_label.text())
+
+    def test_tab_counts_hidden_when_zero(self):
+        # Task 39: no "(0)" noise on a fresh home.
+        self.assertEqual(self.window.tabs.tabText(2), "Quarantine")
+        self.assertEqual(self.window.tabs.tabText(3), "Failed Drops")
+
+    def test_no_prefix_yet(self):
+        # Task 40: no "(0 B used)" for a prefix that does not exist.
+        text = self.window.info_label.text()
+        self.assertIn("No prefix yet", text)
+        self.assertNotIn("0 B used", text)
+
+    def test_watcher_hint_and_repair_button(self):
+        # Task 23: the watcher status is explained, and there is an
+        # Install/Repair action.
+        self.assertIn("Watcher",
+                      self.window.watcher_hint_label.text())
+        self.assertIn("Install or Repair",
+                      self.window.repair_btn.text())
+
 
 class ManagerMainTests(unittest.TestCase):
     """Regression tests for the real entry point (v0.2.1 P0 #1).
@@ -322,12 +869,14 @@ class ManagerMainTests(unittest.TestCase):
         sock.waitForBytesWritten(1000)
         sock.disconnectFromServer()
         # A second launch must exit promptly with code 0, and the
-        # first instance must still be alive afterwards.
+        # first instance must still be alive afterwards. (60 s, not
+        # 20: on a loaded box a fresh Python+Qt start alone can
+        # exceed 20 s, which used to fail this test as a flake.)
         root = Path(__file__).resolve().parent.parent
         second = subprocess.run(
             [sys.executable, str(root / "winlinx" / "manager.py")],
             env=self._env, capture_output=True, text=True,
-            timeout=20)
+            timeout=60)
         self.assertEqual(second.returncode, 0, second.stderr[-2000:])
         self.assertNotIn("Traceback", second.stderr)
         self.assertIsNone(first.poll(),
@@ -345,7 +894,7 @@ class ManagerMainTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         proc = subprocess.run(
             [sys.executable, str(root / "winlinx" / "manager.py")],
-            env=env, capture_output=True, text=True, timeout=20)
+            env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
         self.assertIn("cannot create", proc.stderr)
         self.assertNotIn("already running", proc.stderr)
