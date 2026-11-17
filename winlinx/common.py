@@ -25,11 +25,20 @@ from pathlib import Path
 
 # Single source of truth for the WinLinx version. Every other file
 # imports this (Python) or reads it out of this file (shell scripts).
-__version__ = "0.3"
+__version__ = "0.4"
 
 UPDATE_API_URL = ("https://api.github.com/repos/BROKE-N-BORED/"
                   "WinLinx/releases/latest")
 RELEASES_URL = "https://github.com/BROKE-N-BORED/WinLinx/releases"
+
+
+def _update_api_url():
+    # WINLINX_UPDATE_API_URL overrides the update check endpoint
+    # (test hook only - the tests point it at a fake GitHub).
+    override = os.environ.get("WINLINX_UPDATE_API_URL")
+    if override:
+        return override
+    return UPDATE_API_URL
 
 
 # ---------------------------------------------------------------- paths
@@ -511,24 +520,25 @@ def run_yabridgectl_sync(timeout=180):
 
     The message is plain words for the user: it never names the
     tool, because the manager, the Failed Drops list, and the
-    watcher notification all show it as-is. The technical detail
-    goes in the log only."""
+    watcher notification all show it as-is. A failure is also
+    logged here, once, in those same plain words - callers must
+    not log it again."""
     ctl = find_yabridgectl()
     if not ctl:
-        append_log("WARNING: bridge sync failed (yabridgectl not found)")
+        append_log("WARNING: yabridge is not installed, so plug-ins "
+                   "can't be bridged")
         return False, ("yabridge is not installed, so plug-ins can't "
                        "be bridged")
     try:
         proc = subprocess.run([ctl, "sync"], capture_output=True,
                               text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        append_log("WARNING: bridge sync failed: %s" % exc)
+    except (OSError, subprocess.TimeoutExpired):
+        append_log("WARNING: the plug-in folders could not be "
+                   "re-synced")
         return False, "the plug-in folders could not be re-synced"
     if proc.returncode == 0:
         return True, (proc.stdout or "").strip()
-    err = (proc.stderr or proc.stdout or "").strip()
-    append_log("WARNING: bridge sync failed (exit code %d): %s"
-               % (proc.returncode, err))
+    append_log("WARNING: the plug-in folders could not be re-synced")
     return False, "the plug-in folders could not be re-synced"
 
 
@@ -1410,12 +1420,15 @@ def _parse_version(text):
 def check_for_update(timeout=30):
     """Ask GitHub for the latest WinLinx release and compare it with
     this install. Returns {"available": bool, "latest": str,
-    "url": str, "zip_url": str, "error": str}. Never raises."""
+    "url": str, "zip_url": str, "zip_name": str, "sha_url": str,
+    "error": str}. The sidecar URL is the release's SHA-256 checksum
+    file: an update is only ever installed when its checksum
+    matches. Never raises."""
     result = {"available": False, "latest": "", "url": RELEASES_URL,
-              "zip_url": "", "error": ""}
+              "zip_url": "", "zip_name": "", "sha_url": "", "error": ""}
     try:
         request = urllib.request.Request(
-            UPDATE_API_URL,
+            _update_api_url(),
             headers={"User-Agent": "WinLinx/%s" % __version__,
                      "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(request, timeout=timeout) as resp:
@@ -1428,10 +1441,13 @@ def check_for_update(timeout=30):
     result["url"] = str(data.get("html_url") or RELEASES_URL)
     for asset in data.get("assets") or []:
         name = str(asset.get("name") or "")
+        url = str(asset.get("browser_download_url") or "")
         if name.startswith("winlinx-v") and name.endswith(".zip"):
-            result["zip_url"] = str(
-                asset.get("browser_download_url") or "")
-            break
+            result["zip_url"] = url
+            result["zip_name"] = name
+        elif name.startswith("winlinx-v") \
+                and name.endswith(".zip.sha256"):
+            result["sha_url"] = url
     if tag and _parse_version(tag) > _parse_version(__version__):
         result["available"] = True
     return result

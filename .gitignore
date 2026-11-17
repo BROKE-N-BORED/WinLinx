@@ -1,5 +1,6 @@
 # Build artifacts — regenerated, never committed.
 *.zip
+*.sha256
 __pycache__/
 *.pyc
 # Icon PNGs are generated from winlinx.svg by render_icon.py (and by

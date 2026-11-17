@@ -64,7 +64,8 @@ UNSUPPORTED_ZIP_REASON = (
     "Unzip it first - WinLinx handles .exe, .msi, .vst3, .dll and "
     ".clap files")
 UNSUPPORTED_REASON = (
-    "WinLinx handles .exe, .msi, .vst3, .dll and .clap files")
+    "This file type isn't handled - it was left in place. WinLinx "
+    "handles .exe, .msi, .vst3, .dll and .clap files.")
 FOLDER_REASON = (
     "WinLinx cannot open folders - open it and double-click the "
     "program inside to run it")
@@ -83,6 +84,15 @@ def _folder_reason(path, kind):
     if path.name.lower().endswith(".vst3") and kind == "program":
         return FOLDER_VST3_IN_PROGRAMS_REASON
     return FOLDER_REASON
+
+
+def _join_names(names):
+    """'a.exe', 'a.exe and b.exe', 'a.exe, b.exe and c.exe'."""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return "%s and %s" % (names[0], names[1])
+    return "%s and %s" % (", ".join(names[:-1]), names[-1])
 
 
 def _plain_sync_reason(message):
@@ -237,7 +247,20 @@ class Watcher:
 
     # -- public -----------------------------------------------------
 
+    def _reload_handled(self):
+        """Re-read handled.json from disk so records written by the
+        runner (or cleared by the manager) are visible to this
+        long-running process. Marks save synchronously under the
+        same lock, so the disk copy is never behind this process's
+        own marks."""
+        with self._lock:
+            self._handled = _load_state()
+
     def scan_once(self):
+        # Pick up what the runner recorded (or the manager cleared)
+        # since the last pass, or a double-clicked file would be
+        # handled a second time by this process.
+        self._reload_handled()
         # Send the batched failure notifications queued since the
         # last pass before looking for new work. A slow worker that
         # has not finished yet reports at a later pass.
@@ -379,30 +402,43 @@ class Watcher:
     # -- batched failure notifications -------------------------------
 
     def _queue_failure_notification(self, name, reason):
-        """Hold a first-attempt failure so same-reason failures from
-        one drop land as one notification ("3 files could not be
-        handled: Wine is not installed") instead of a stack of
-        popups. Flushed at the start of the next scan pass."""
+        """Hold a first-attempt failure so failures from one drop
+        land as one notification instead of a stack of popups.
+        Flushed at the start of the next scan pass."""
         with self._pending_lock:
             self._pending_failures.setdefault(reason, []).append(name)
 
     def _flush_failure_notifications(self):
-        """Send one notification per pending failure reason, each
-        pointing at the Program Manager. Called at the start of
-        every scan pass, and by --once before it exits."""
+        """Send the pending failure notifications: one notification
+        per reason when a single reason is pending, a single summary
+        listing one line per reason when several fired at once. When
+        three or fewer files share a reason they are named; more
+        than that, only the count. Called at the start of every scan
+        pass, and by --once before it exits."""
         with self._pending_lock:
             pending = self._pending_failures
             self._pending_failures = {}
+        if not pending:
+            return
+        lines = []
         for reason, names in sorted(pending.items()):
-            if len(names) == 1:
-                message = ("%s could not be handled: %s - see the "
-                           "WinLinx Program Manager."
-                           % (names[0], reason))
+            ordered = sorted(names)
+            if len(ordered) == 1:
+                lines.append("%s could not be handled: %s"
+                             % (ordered[0], reason))
+            elif len(ordered) <= 3:
+                lines.append("%s could not be handled: %s"
+                             % (_join_names(ordered), reason))
             else:
-                message = ("%d files could not be handled: %s - see "
-                           "the WinLinx Program Manager."
-                           % (len(names), reason))
-            common.notify("WinLinx", message)
+                lines.append("%d files could not be handled: %s"
+                             % (len(ordered), reason))
+        if len(lines) == 1:
+            message = (lines[0] + " - see the WinLinx Program "
+                       "Manager.")
+        else:
+            message = ("\n".join(lines)
+                       + "\nSee the WinLinx Program Manager.")
+        common.notify("WinLinx", message)
 
     def _handle(self, path, kind, is_dir, fingerprint):
         # 0. Unsupported files: never scanned, never run. Logged and
@@ -460,17 +496,17 @@ class Watcher:
             else:
                 # A dropped folder is not ignored: it is recorded as
                 # a failed drop so the manager shows it, with what to
-                # do next. Only claim a scan ran when one did.
+                # do next. Only claim a scan ran when one did. The
+                # log uses the folder reason's own wording: a .vst3
+                # bundle in Programs has no program inside to run.
+                reason = _folder_reason(path, kind)
                 if scanned_clean:
                     log("Folder scanned clean, left in place: %s "
-                        "(open it and double-click the program inside "
-                        "to run it)" % path.name)
+                        "(%s)" % (path.name, reason))
                 else:
-                    log("Folder left in place: %s (open it and "
-                        "double-click the program inside to run it)"
-                        % path.name)
-                self._mark_failed(path, fingerprint,
-                                  _folder_reason(path, kind),
+                    log("Folder left in place: %s (%s)"
+                        % (path.name, reason))
+                self._mark_failed(path, fingerprint, reason,
                                   permanent=True)
             return
 
@@ -586,9 +622,9 @@ class Watcher:
         if ok:
             log("Bridges re-synced")
             return True, ""
-        reason = _plain_sync_reason(message)
-        log("WARNING: %s" % reason)
-        return False, reason
+        # The failure is already logged once, in plain words, by
+        # common.run_yabridgectl_sync - do not log it again here.
+        return False, _plain_sync_reason(message)
 
 
 # ---------------------------------------------------------------- main

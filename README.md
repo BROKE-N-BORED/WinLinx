@@ -1,4 +1,4 @@
-# WinLinx 0.3
+# WinLinx 0.4
 
 After installing this once, Windows programs and VST plug-ins just
 work on Linux Mint - no manual setup per file, ever.
@@ -44,6 +44,12 @@ quarantined files, failed drops (with Retry), live activity, and
 the log. The File menu has prefix backup/restore, the update check,
 and the GUI uninstaller; the Help menu has the How to Use index.
 
+**WinLinx updates itself:** when a new version is out, the Program
+Manager asks on startup, downloads it only when you say yes,
+checks it before installing, and restarts to finish. Pick Later
+and the update waits until the next start. Help menu, Check for
+Updates checks any time.
+
 ## The scanner
 
 Every file is scanned with ClamAV (PUA detection on, so bloatware
@@ -79,7 +85,7 @@ Wine, yabridge, and ClamAV stay installed; your Wine prefix,
 `~/WinLinx`, and quarantined files are left alone (quarantined
 files move to `~/WinLinx/Quarantine`).
 
-## Honest limits (0.3)
+## Honest limits (0.4)
 
 - Not every Windows program runs under Wine - some copy protection
   and some iLok-protected plug-ins fail. That is a Wine limit, not

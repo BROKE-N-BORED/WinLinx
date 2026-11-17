@@ -17,6 +17,7 @@ breaks GUI extraction - see ~/AGENTS.md (Design Shell v1.0 lesson).
 The .desktop launcher MUST be executable or Nemo will not run it.
 """
 
+import hashlib
 import os
 import sys
 import zipfile
@@ -41,10 +42,12 @@ INCLUDE = [
     "uninstall.sh",
     "render_icon.py",
     "winlinx/__init__.py",
+    "winlinx/apply_update.py",
     "winlinx/common.py",
     "winlinx/installer.py",
     "winlinx/manager.py",
     "winlinx/scanner.py",
+    "winlinx/updater.py",
     "winlinx/watcher.py",
     "winlinx/run-windows-file",
     "winlinx/icons/winlinx.svg",
@@ -126,6 +129,20 @@ def main():
         for info in zf.infolist():
             print("%s %s" % (oct(info.external_attr >> 16),
                              info.filename))
+    # The checksum sidecar ships next to the zip as a second release
+    # asset (NOT inside the zip): the self-updater downloads it and
+    # refuses the zip unless the checksum matches.
+    digest = hashlib.sha256()
+    with open(OUT, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 256)
+            if not chunk:
+                break
+            digest.update(chunk)
+    sidecar = OUT.with_suffix(".zip.sha256")
+    sidecar.write_text("%s  %s\n" % (digest.hexdigest(), OUT.name),
+                       encoding="utf-8")
+    print("wrote %s" % sidecar)
     return 0
 
 

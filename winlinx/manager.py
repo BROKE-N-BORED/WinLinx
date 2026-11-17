@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import common
 import scanner
+import updater
 import watcher
 
 from PySide6.QtCore import (
@@ -169,6 +170,63 @@ def format_threats_text(target, threats):
     threat names (never the full path repeated per threat)."""
     names = sorted({name for _, name in threats})
     return "%s\n\nThreats found:\n%s" % (target, "\n".join(names))
+
+
+def format_folder_threats_text(folder, threats):
+    """Threats dialog text for a folder scan: each infected file
+    with its own threats underneath, so the user can see what will
+    be quarantined. Files are shown relative to the folder when
+    they are inside it, and sorted A-to-Z with their threats."""
+    grouped = {}
+    for path, name in threats:
+        grouped.setdefault(path, set()).add(name)
+    lines = [str(folder), "", "Threats found:"]
+    folder_path = Path(folder)
+    for path in sorted(grouped):
+        try:
+            shown = str(Path(path).relative_to(folder_path))
+        except ValueError:
+            shown = path
+        lines.append(shown)
+        for name in sorted(grouped[path]):
+            lines.append("    " + name)
+    return "\n".join(lines)
+
+
+def describe_action_failure(name, message, action):
+    """A failure dialog text that names the program and says what
+    to do next, matching the launch dialog. `action` is what the
+    program cannot do, e.g. "run in its own prefix"."""
+    if message == "Wine is not installed":
+        return ("Wine is not installed, so %s cannot %s. Re-run the "
+                "installer to set it up." % (name, action))
+    if message.endswith("."):
+        return "%s cannot %s: %s" % (name, action, message)
+    return "%s cannot %s: %s." % (name, action, message)
+
+
+def is_in_watched_folder(path):
+    """True when path is inside ~/WinLinx/Programs or
+    ~/WinLinx/Plugins - the only folders the watcher scans. A file
+    anywhere else is never picked up by the watcher, so Retry must
+    not promise that it will be."""
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return False
+    for folder in (common.programs_folder(), common.plugins_folder()):
+        try:
+            if resolved.is_relative_to(folder.resolve()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+# Extensions the runner (run-windows-file) handles. A failed drop
+# of any other kind cannot be re-run, so Retry says so instead of
+# pretending to try.
+RUNNER_EXTENSIONS = (".exe", ".msi", ".vst3", ".dll", ".clap")
 
 
 class ActivityHighlighter(QSyntaxHighlighter):
@@ -385,10 +443,12 @@ HOW_TO_USE = [
      "the prefix with .before-restore- in its name, and WinLinx "
      "keeps only the newest aside copy."),
     ("Updates",
-     "Help menu, Check for Updates: asks GitHub for the latest "
-     "WinLinx release. When a newer version exists, you can download "
-     "it (it lands in ~/Downloads - unzip it and double-click "
-     "Install WinLinx) or open the release page."),
+     "WinLinx checks for updates when it starts. If a newer version "
+     "exists, a popup asks whether to update - nothing downloads "
+     "until you say yes. The download is checked before it "
+     "installs, and WinLinx restarts to finish. Pick Later and the "
+     "update waits until the next start.\\n\\n"
+     "Help menu, Check for Updates checks right away, any time."),
     ("When something goes wrong",
      "If ClamAV is missing, a banner at the top of the window says "
      "so, with an Install button - files run unscanned until it is "
@@ -522,7 +582,7 @@ class UninstallDialog(QDialog):
 # ---------------------------------------------------------------- window
 
 class ManagerWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, startup_update_check=True):
         super().__init__()
         self.setWindowTitle("WinLinx Program Manager %s"
                             % common.__version__)
@@ -534,6 +594,12 @@ class ManagerWindow(QMainWindow):
         if saved is not None:
             self.restoreGeometry(saved)
         self._worker = None
+        # The silent startup update check runs on its own worker so
+        # it never fights the refresh worker (U30).
+        self._update_check_worker = None
+        # One update popup at a time (U18): the startup check and a
+        # manual check can overlap, and two popups must never stack.
+        self._update_popup_open = False
         self._busy_buttons = []
         self._programs = []
         self._plugins = []
@@ -576,6 +642,11 @@ class ManagerWindow(QMainWindow):
         self._build_shortcuts()
         self.statusBar().showMessage("Ready")
         self.refresh()
+        if startup_update_check:
+            # Silent check on launch: a moment after the window is
+            # up, quietly ask for the latest release. Up to date
+            # means nothing happens at all - no popup, no noise.
+            QTimer.singleShot(1500, self._startup_update_check)
 
     # -- construction ----------------------------------------------
 
@@ -664,9 +735,16 @@ class ManagerWindow(QMainWindow):
              "Prefix"])
         self.programs_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
+        # Every action uses only the first selected row, so
+        # multi-select is meaningless - and it is what let a stale
+        # selection survive a refresh next to the restored one.
+        self.programs_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection)
+        self.programs_table.verticalHeader().setVisible(False)
         self.programs_table.setEditTriggers(
             QTableWidget.EditTrigger.NoEditTriggers)
         self.programs_table.setSortingEnabled(True)
+        self._init_table_sort(self.programs_table, "programs")
         self.programs_table.setTextElideMode(
             Qt.TextElideMode.ElideMiddle)
         self.programs_table.setItemDelegate(
@@ -736,9 +814,13 @@ class ManagerWindow(QMainWindow):
             ["Name", "Type", "Status", "Source File"])
         self.plugins_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
+        self.plugins_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection)
+        self.plugins_table.verticalHeader().setVisible(False)
         self.plugins_table.setEditTriggers(
             QTableWidget.EditTrigger.NoEditTriggers)
         self.plugins_table.setSortingEnabled(True)
+        self._init_table_sort(self.plugins_table, "plugins")
         self.plugins_table.setTextElideMode(
             Qt.TextElideMode.ElideMiddle)
         self.plugins_table.setItemDelegate(
@@ -796,9 +878,13 @@ class ManagerWindow(QMainWindow):
             ["Name", "Threat", "Original Location", "Date"])
         self.quarantine_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
+        self.quarantine_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection)
+        self.quarantine_table.verticalHeader().setVisible(False)
         self.quarantine_table.setEditTriggers(
             QTableWidget.EditTrigger.NoEditTriggers)
         self.quarantine_table.setSortingEnabled(True)
+        self._init_table_sort(self.quarantine_table, "quarantine")
         self.quarantine_table.setTextElideMode(
             Qt.TextElideMode.ElideMiddle)
         self.quarantine_table.setItemDelegate(
@@ -850,9 +936,13 @@ class ManagerWindow(QMainWindow):
             ["File", "Reason", "Attempts", "Last Tried"])
         self.failed_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
+        self.failed_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection)
+        self.failed_table.verticalHeader().setVisible(False)
         self.failed_table.setEditTriggers(
             QTableWidget.EditTrigger.NoEditTriggers)
         self.failed_table.setSortingEnabled(True)
+        self._init_table_sort(self.failed_table, "failed")
         self.failed_table.setTextElideMode(
             Qt.TextElideMode.ElideMiddle)
         self.failed_table.setItemDelegate(
@@ -904,6 +994,7 @@ class ManagerWindow(QMainWindow):
         layout.addLayout(top)
         self.activity_view = QPlainTextEdit()
         self.activity_view.setReadOnly(True)
+        self.activity_view.setPlaceholderText("No activity yet")
         self._activity_highlighter = ActivityHighlighter(
             self.activity_view.document())
         layout.addWidget(self.activity_view)
@@ -931,6 +1022,11 @@ class ManagerWindow(QMainWindow):
         layout.addWidget(QLabel("Recent activity:"))
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText("No activity yet")
+        # Coloured like the Activity tab, so a warning reads as a
+        # warning on both tabs.
+        self._log_highlighter = ActivityHighlighter(
+            self.log_view.document())
         layout.addWidget(self.log_view)
         row = QHBoxLayout()
         self.open_programs_btn = self._register_busy(
@@ -1061,6 +1157,45 @@ class ManagerWindow(QMainWindow):
         self._run_worker(gather_all, self._populate, "Scanning…",
                          quiet=quiet)
 
+    # -- table sorting ------------------------------------------------
+
+    def _load_table_sort(self, key):
+        """The user's last sort for a table, as (column, order).
+        Default is column 0, A-to-Z."""
+        raw = self._settings.value("sort/" + key, "0:0")
+        try:
+            column, order = (int(part) for part in str(raw).split(":"))
+        except (ValueError, TypeError):
+            return 0, Qt.SortOrder.AscendingOrder
+        if order == 1:
+            return column, Qt.SortOrder.DescendingOrder
+        return column, Qt.SortOrder.AscendingOrder
+
+    def _save_table_sort(self, key, section, order):
+        self._settings.setValue(
+            "sort/" + key, "%d:%d" % (section, order.value))
+        self._settings.sync()
+
+    def _init_table_sort(self, table, key):
+        """Remember this table's sort between runs, and start it on
+        the user's last sort (A-to-Z on column 0 the first time)."""
+        table.horizontalHeader().sortIndicatorChanged.connect(
+            lambda section, order, k=key:
+            self._save_table_sort(k, section, order))
+        section, order = self._load_table_sort(key)
+        table.sortByColumn(section, order)
+
+    def _apply_table_sorts(self):
+        """Re-apply each table's remembered sort after a fill, so a
+        refresh never silently reorders the rows."""
+        for table, key in (
+                (self.programs_table, "programs"),
+                (self.plugins_table, "plugins"),
+                (self.quarantine_table, "quarantine"),
+                (self.failed_table, "failed")):
+            section, order = self._load_table_sort(key)
+            table.sortItems(section, order)
+
     def _save_table_state(self, table):
         """Selected row key + scroll position, so a refresh can put
         the view back where it was (U28)."""
@@ -1080,6 +1215,7 @@ class ManagerWindow(QMainWindow):
         }
 
     def _restore_table_state(self, table, state):
+        found = False
         if state["selected"] is not None:
             for row in range(table.rowCount()):
                 item = table.item(row, 0)
@@ -1091,7 +1227,15 @@ class ManagerWindow(QMainWindow):
                         or data.get("path") == state["selected"]
                         or data.get("id") == state["selected"]):
                     table.selectRow(row)
+                    found = True
                     break
+        if not found:
+            # The selected row is gone (or nothing was selected):
+            # make sure nothing is selected. Qt moves the selection
+            # to row 0 when the current row disappears during the
+            # rebuild, which would leave a row selected that the
+            # user never chose.
+            table.clearSelection()
         table.horizontalScrollBar().setValue(state["h"])
         table.verticalScrollBar().setValue(state["v"])
 
@@ -1107,6 +1251,7 @@ class ManagerWindow(QMainWindow):
         self._fill_plugins()
         self._fill_quarantine()
         self._fill_failed()
+        self._apply_table_sorts()
         for table, state in states.items():
             self._restore_table_state(table, state)
         scanstat = data["scanner"]
@@ -1180,6 +1325,11 @@ class ManagerWindow(QMainWindow):
 
     def _fill_programs(self):
         table = self.programs_table
+        # Clear the selection first: without this the selection jumps
+        # to row 0 during the rebuild and _restore_table_state then
+        # adds the real row back, leaving two rows selected and
+        # actions acting on the wrong one.
+        table.clearSelection()
         table.setSortingEnabled(False)
         table.setRowCount(len(self._programs))
         for row, prog in enumerate(self._programs):
@@ -1215,6 +1365,7 @@ class ManagerWindow(QMainWindow):
 
     def _fill_plugins(self):
         table = self.plugins_table
+        table.clearSelection()
         table.setSortingEnabled(False)
         table.setRowCount(len(self._plugins))
         for row, plug in enumerate(self._plugins):
@@ -1249,6 +1400,7 @@ class ManagerWindow(QMainWindow):
 
     def _fill_quarantine(self):
         table = self.quarantine_table
+        table.clearSelection()
         table.setSortingEnabled(False)
         table.setRowCount(len(self._quarantine))
         for row, entry in enumerate(self._quarantine):
@@ -1267,6 +1419,7 @@ class ManagerWindow(QMainWindow):
 
     def _fill_failed(self):
         table = self.failed_table
+        table.clearSelection()
         table.setSortingEnabled(False)
         table.setRowCount(len(self._failed))
         for row, item in enumerate(self._failed):
@@ -1357,10 +1510,16 @@ class ManagerWindow(QMainWindow):
         """Show the Activity feed, honouring the warnings-only
         filter. The System tab keeps the full log either way."""
         text = self._activity_full_text
+        placeholder = "No activity yet"
         if self.activity_warnings_only.isChecked():
             lines = [line for line in text.splitlines()
                      if "WARNING" in line or "ERROR" in line]
             text = "\n".join(lines)
+            if not text and self._activity_full_text.strip():
+                # There is activity, just no warnings - say that
+                # instead of pretending the log is empty.
+                placeholder = "No warnings yet"
+        self.activity_view.setPlaceholderText(placeholder)
         self.activity_view.setPlainText(text)
         self.activity_view.verticalScrollBar().setValue(
             self.activity_view.verticalScrollBar().maximum())
@@ -1547,8 +1706,11 @@ class ManagerWindow(QMainWindow):
                 self._refresh_with_message(
                     "%s has its own prefix now" % prog["name"])
             else:
-                QMessageBox.warning(self, "Could not create prefix",
-                                    message)
+                QMessageBox.warning(
+                    self, "Could not create prefix",
+                    describe_action_failure(
+                        prog["name"], message,
+                        "run in its own prefix"))
                 self.refresh()
 
         self._run_worker(
@@ -1581,8 +1743,11 @@ class ManagerWindow(QMainWindow):
                     % (prog["name"],
                        common.WINDOWS_VERSION_LABELS[version]))
             else:
-                QMessageBox.warning(self, "Could not set Windows "
-                                    "version", message)
+                QMessageBox.warning(
+                    self, "Could not set Windows version",
+                    describe_action_failure(
+                        prog["name"], message,
+                        "change Windows version"))
                 self.refresh()
 
         self._run_worker(do_set, done, "Setting Windows version…")
@@ -1722,9 +1887,77 @@ class ManagerWindow(QMainWindow):
         if item is None:
             self.statusBar().showMessage("Select a failed drop first")
             return
-        watcher.clear_handled(item["path"])
-        self._refresh_with_message(
-            "Retrying %s - the watcher will pick it up" % item["name"])
+        path = Path(item["path"])
+        if is_in_watched_folder(path):
+            # Inside a watched folder the watcher is the authority:
+            # clearing the record lets it pick the file up again
+            # (and if the file is gone, the stale entry just goes
+            # away - there is nothing left to retry).
+            watcher.clear_handled(item["path"])
+            self._refresh_with_message(
+                "Retrying %s - the watcher will pick it up"
+                % item["name"])
+            return
+        if not path.exists():
+            # The file is gone: keep the record (the user can Forget
+            # it) and say so, instead of retrying a ghost.
+            self.statusBar().showMessage(
+                "Cannot retry %s: the file is no longer there"
+                % item["name"])
+            return
+        if path.suffix.lower() not in RUNNER_EXTENSIONS:
+            # The runner does nothing with this kind of file, so
+            # running it would be a pretend retry. Keep the record
+            # and say plainly that there is nothing to retry.
+            QMessageBox.information(
+                self, "Nothing to retry",
+                "WinLinx cannot run %s: it only handles .exe, .msi, "
+                ".vst3, .dll and .clap files. The file was left in "
+                "place." % item["name"])
+            self.statusBar().showMessage(
+                "Cannot retry %s" % item["name"])
+            return
+        # Outside a watched folder the watcher can never see this
+        # file, so the manager re-runs it through the runner path
+        # directly, in a worker thread. The record is left alone:
+        # the runner records a fresh failure if it fails again, and
+        # records the success if it works.
+        before = next(
+            (entry for entry in watcher.load_failed()
+             if entry["path"] == item["path"]), None)
+        attempts_before = before["attempts"] if before else 0
+
+        def do_retry():
+            runner = (Path(__file__).resolve().parent
+                      / "run-windows-file")
+            env = dict(os.environ)
+            # The runner finds its layer under $HOME; point it at
+            # the same home the manager uses.
+            env["HOME"] = str(common.home())
+            try:
+                subprocess.run(["bash", str(runner), item["path"]],
+                               env=env, capture_output=True,
+                               timeout=600)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                common.append_log("Retry failed for %s: %s"
+                                  % (item["name"], exc))
+            return None
+
+        def done(_result):
+            after = next(
+                (entry for entry in watcher.load_failed()
+                 if entry["path"] == item["path"]), None)
+            if after is not None and after["attempts"] > attempts_before:
+                message = ("Still could not handle %s: %s"
+                           % (item["name"],
+                              common.plain_drop_reason(
+                                  after["reason"])))
+            else:
+                message = "Retried %s" % item["name"]
+            self._refresh_with_message(message)
+
+        self._run_worker(do_retry, done,
+                         "Retrying %s…" % item["name"])
 
     def _forget_failed(self):
         item = self._selected_row_data(self.failed_table)
@@ -1797,9 +2030,20 @@ class ManagerWindow(QMainWindow):
                 return
             box = QMessageBox(self)
             box.setWindowTitle("Threats found")
-            box.setText(format_threats_text(target, result["threats"]))
-            box.setInformativeText(
-                "Quarantine it so it can't install or run?")
+            files = sorted({path for path, _ in result["threats"]})
+            if len(files) > 1:
+                # A folder scan: list each file with its own threats,
+                # and word the question for the count.
+                box.setText(format_folder_threats_text(
+                    target, result["threats"]))
+                box.setInformativeText(
+                    "Quarantine these %d files so they can't install "
+                    "or run?" % len(files))
+            else:
+                box.setText(format_threats_text(target,
+                                                result["threats"]))
+                box.setInformativeText(
+                    "Quarantine it so it can't install or run?")
             quarantine_btn = box.addButton(
                 "Quarantine", QMessageBox.ButtonRole.DestructiveRole)
             leave_btn = box.addButton(
@@ -1808,7 +2052,8 @@ class ManagerWindow(QMainWindow):
             box.exec()
             if box.clickedButton() is quarantine_btn:
                 scanner.quarantine_item(target, result["threats"])
-                self._refresh_with_message("Quarantined %s" % target)
+                self._refresh_with_message(
+                    "Quarantined %s" % Path(target).name)
 
         self._run_worker(do_scan, done, "Scanning %s…" % target)
 
@@ -2042,6 +2287,64 @@ class ManagerWindow(QMainWindow):
         self._run_worker(common.write_debug_report, done,
                          "Writing debug report…")
 
+    def _startup_update_check(self):
+        """The silent check on launch. Up to date, no network, or a
+        failed check all mean the same thing to the user: nothing
+        happens. Only a newer release gets a popup."""
+        if self._update_check_worker is not None \
+                and self._update_check_worker.isRunning():
+            return
+
+        def done(result):
+            self._update_check_worker = None
+            if result.get("error") or not result.get("available"):
+                return
+            self._offer_update(result)
+
+        def failed(message):
+            # Silent by design: the log keeps the detail.
+            self._update_check_worker = None
+            common.append_log("Startup update check failed: %s"
+                              % message)
+
+        worker = Worker(common.check_for_update, self)
+        worker.finished.connect(done)
+        worker.failed.connect(failed)
+        self._update_check_worker = worker
+        worker.start()
+
+    def _offer_update(self, result):
+        """The "a newer version exists" popup, shared by the startup
+        check and the Help-menu check. Nothing downloads until the
+        user taps Update. The default button is Later (U23's spirit:
+        the button Enter picks is the one that does nothing)."""
+        if self._update_popup_open:
+            return
+        latest = str(result.get("latest") or "").lstrip("vV")
+        box = QMessageBox(self)
+        box.setWindowTitle("Update available")
+        box.setText("WinLinx %s is available (you have %s)."
+                    % (latest, common.__version__))
+        box.setInformativeText(
+            "Update now? WinLinx downloads the update, checks it, "
+            "and restarts to finish.")
+        update_btn = box.addButton(
+            "Update", QMessageBox.ButtonRole.AcceptRole)
+        page_btn = box.addButton(
+            "Open Release Page", QMessageBox.ButtonRole.ActionRole)
+        later_btn = box.addButton(
+            "Later", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(later_btn)
+        self._update_popup_open = True
+        try:
+            box.exec()
+        finally:
+            self._update_popup_open = False
+        if box.clickedButton() is update_btn:
+            self._pull_update(result)
+        elif box.clickedButton() is page_btn:
+            QDesktopServices.openUrl(QUrl(result["url"]))
+
     def _check_updates(self):
         def done(result):
             if result.get("error"):
@@ -2058,66 +2361,70 @@ class ManagerWindow(QMainWindow):
                     "WinLinx %s is the latest version."
                     % common.__version__)
                 return
-            box = QMessageBox(self)
-            box.setWindowTitle("Update available")
-            box.setText("WinLinx %s is available (you have %s)."
-                        % (result["latest"], common.__version__))
-            box.setInformativeText("Download it now?")
-            download_btn = box.addButton(
-                "Download", QMessageBox.ButtonRole.AcceptRole)
-            page_btn = box.addButton(
-                "Open Release Page", QMessageBox.ButtonRole.ActionRole)
-            box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
-            box.setDefaultButton(download_btn)
-            box.exec()
-            if box.clickedButton() is download_btn:
-                self._download_update(result)
-            elif box.clickedButton() is page_btn:
-                QDesktopServices.openUrl(QUrl(result["url"]))
+            self._offer_update(result)
 
         self._run_worker(common.check_for_update, done,
                          "Checking for updates…")
 
-    def _download_update(self, result):
+    def _pull_update(self, result):
+        """Download the release zip AND its checksum sidecar, verify
+        the checksum, and stage the update - all in a worker thread
+        with a progress dialog and Cancel (U26, U30)."""
+        latest = str(result.get("latest") or "").lstrip("vV")
         zip_url = result.get("zip_url")
-        if not zip_url:
-            QDesktopServices.openUrl(QUrl(result["url"]))
+        sha_url = result.get("sha_url")
+        zip_name = result.get("zip_name")
+        if not zip_url or not sha_url or not zip_name:
+            common.append_log("Update %s has no checksum to verify "
+                              "against - refusing it" % latest)
+            QMessageBox.warning(
+                self, "Update not installed",
+                "This update is missing its safety check, so "
+                "WinLinx will not install it.")
             return
-        dest = common.home() / "Downloads" / (
-            "winlinx-%s.zip" % result["latest"])
         progress = QProgressDialog(
-            "Downloading WinLinx %s…" % result["latest"],
+            "Downloading WinLinx %s…" % latest,
             "Cancel", 0, 100, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
-        worker = ProgressWorker(
-            lambda report: common.download_file(zip_url, dest,
-                                                progress=report),
-            self)
+
+        def do_pull(report):
+            ok, message, zip_path = updater.download_and_verify(
+                zip_url, sha_url, latest, zip_name,
+                progress=report)
+            if not ok:
+                return ok, message, None
+            ok, message, tree = updater.stage_zip(zip_path, latest)
+            return ok, message, tree
+
+        worker = ProgressWorker(do_pull, self)
 
         def on_progress(done, total):
             if total:
                 progress.setValue(int(done * 100 / total))
                 progress.setLabelText(
                     "Downloading WinLinx %s: %s of %s"
-                    % (result["latest"], common.format_size(done),
+                    % (latest, common.format_size(done),
                        common.format_size(total)))
 
         def on_done(res):
             progress.close()
-            ok, message = res
+            ok, message, tree = res
             if ok:
-                QMessageBox.information(
-                    self, "Downloaded",
-                    "Saved to %s.\n\nUnzip it and double-click "
-                    "Install WinLinx to update." % dest)
+                self._ask_restart(latest, tree)
+            elif message == "cancelled":
+                self.statusBar().showMessage("Update cancelled")
             else:
-                QMessageBox.warning(self, "Download failed",
-                                    message or "The download failed.")
+                QMessageBox.warning(self, "Update not installed",
+                                    message)
 
         def on_failed(message):
             progress.close()
-            QMessageBox.warning(self, "Download failed", message)
+            common.append_log("Update pull failed: %s" % message)
+            QMessageBox.warning(
+                self, "Update not installed",
+                "The update could not be downloaded. Check your "
+                "internet connection and try again.")
 
         worker.progress.connect(on_progress)
         worker.finished.connect(on_done)
@@ -2125,6 +2432,61 @@ class ManagerWindow(QMainWindow):
         progress.canceled.connect(
             lambda: setattr(worker, "cancelled", True))
         worker.start()
+
+    def _ask_restart(self, version, tree_dir):
+        """The update is downloaded, checked, and staged. Restart
+        now to finish, or Later to finish at the next start."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Update ready")
+        box.setText("WinLinx %s is downloaded and checked. "
+                    "Restart now to finish updating?" % version)
+        restart_btn = box.addButton(
+            "Restart Now", QMessageBox.ButtonRole.AcceptRole)
+        later_btn = box.addButton(
+            "Later", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(later_btn)
+        box.exec()
+        if box.clickedButton() is restart_btn:
+            self._restart_for_update(version, tree_dir)
+        else:
+            updater.write_pending(version, tree_dir)
+            self.statusBar().showMessage(
+                "Update %s will finish next time WinLinx starts"
+                % version)
+
+    def _restart_for_update(self, version, tree_dir):
+        """Record the staged update, hand it to the apply helper
+        (which waits for this process to exit, swaps the files in,
+        and relaunches the manager), and quit."""
+        updater.write_pending(version, tree_dir)
+        log_path = updater.updates_dir() / "apply.log"
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = open(log_path, "ab")
+        except OSError:
+            log_file = subprocess.DEVNULL
+        argv = updater.helper_argv(
+            tree_dir, os.getpid(),
+            Path(__file__).resolve())
+        try:
+            subprocess.Popen(argv, start_new_session=True,
+                             stdout=log_file, stderr=log_file)
+        except OSError as exc:
+            common.append_log("Could not start the update helper: %s"
+                              % exc)
+            QMessageBox.warning(
+                self, "Update not installed",
+                "WinLinx could not restart to finish the update. "
+                "It will finish next time WinLinx starts.")
+            return
+        finally:
+            # The helper inherited the log handle; this copy can go.
+            if log_file is not subprocess.DEVNULL:
+                try:
+                    log_file.close()
+                except OSError:
+                    pass
+        QApplication.instance().quit()
 
     # -- menu windows ----------------------------------------------------
 
@@ -2196,6 +2558,30 @@ def main(argv=None):
             QMessageBox.information(
                 None, "WinLinx", "WinLinx is already running.")
         return 0
+    # A deferred update (the user picked Later): apply it now, then
+    # restart on the new code, so the window that opens IS the new
+    # version. The lock is released before the restart - the new
+    # process takes it fresh (the lock file names this pid, and a
+    # restart keeps the pid, so holding it would look like a second
+    # instance). If the restart itself fails, re-lock and carry on
+    # with the old code; the new files load at the next launch.
+    applied, message, _backup = updater.apply_pending()
+    if applied:
+        common.append_log("Deferred update applied: restarting "
+                          "on WinLinx %s" % applied)
+        lock.unlock()
+        try:
+            os.execv(sys.executable,
+                     [sys.executable, os.path.abspath(__file__)]
+                     + list(args[1:]))
+        except OSError:
+            common.append_log("Could not restart after the update; "
+                              "the new version loads next launch")
+            if not lock.tryLock(0):
+                return 0
+    elif message:
+        common.append_log("Deferred update could not be applied: %s"
+                          % message)
     server = QLocalServer()
     QLocalServer.removeServer(SERVER_NAME)
     server.listen(SERVER_NAME)

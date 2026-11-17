@@ -74,6 +74,26 @@ class BuildZipTests(unittest.TestCase):
                          "winlinx/run-windows-file"):
                 path = out / ("winlinx-v%s" % build_zip.VERSION) / name
                 self.assertTrue(os.access(path, os.X_OK), name)
+            # The checksum sidecar ships next to the zip (a second
+            # release asset, NOT inside the zip): the self-updater
+            # refuses a zip whose checksum does not match it.
+            import hashlib
+            sidecar = zip_path.with_suffix(".zip.sha256")
+            self.assertTrue(sidecar.is_file())
+            digest = hashlib.sha256()
+            with open(zip_path, "rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 256)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            self.assertEqual(
+                sidecar.read_text(encoding="utf-8"),
+                "%s  %s\n" % (digest.hexdigest(), zip_path.name))
+            with zipfile.ZipFile(zip_path) as zf:
+                self.assertEqual(
+                    [n for n in zf.namelist()
+                     if n.endswith(".sha256")], [])
 
 
 class SourceHygieneTests(unittest.TestCase):
@@ -133,6 +153,7 @@ class SourceHygieneTests(unittest.TestCase):
         bad = []
         for rel in ("winlinx/common.py", "winlinx/installer.py",
                     "winlinx/manager.py", "winlinx/scanner.py",
+                    "winlinx/updater.py", "winlinx/apply_update.py",
                     "winlinx/watcher.py", "winlinx/run-windows-file",
                     "build_zip.py", "install.sh", "uninstall.sh",
                     "install-winlinx.py", "render_icon.py"):
@@ -157,6 +178,7 @@ class SourceHygieneTests(unittest.TestCase):
     def test_python_version_flags(self):
         # The Python CLIs report the same version.
         for script in ("winlinx/scanner.py", "winlinx/watcher.py",
+                       "winlinx/apply_update.py",
                        "install-winlinx.py"):
             proc = subprocess.run(
                 [sys.executable, str(ROOT / script), "--version"],

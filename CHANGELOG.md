@@ -1,5 +1,99 @@
 # WinLinx changelog
 
+## 0.4 - 2026-11-17
+
+All 16 tasks from the 2026-11-17 dogfood review of v0.3, fixed in one
+release. Plus WinLinx updates itself now.
+
+Auto-update:
+
+- The Program Manager quietly checks for a new version when it
+  starts. Up to date means nothing happens at all - no popup, no
+  noise. When a newer version exists, a popup asks whether to
+  update, and nothing downloads until you say yes.
+- The update downloads its SHA-256 checksum file alongside the
+  release zip, and the zip is only installed when the checksum
+  matches. A release with no checksum, or a download that did not
+  arrive intact, is refused and the current version stays put.
+- Once the update is downloaded and checked, WinLinx asks whether
+  to restart now to finish. Yes restarts the program on its own
+  with the update applied. No waits - the update finishes at the
+  next start. The previous version is kept as a backup, so a
+  failed update rolls back instead of leaving a half-updated
+  install.
+- Help menu, Check for Updates still checks right away, any time,
+  and offers the same verified update.
+
+No more double-runs:
+
+- A program double-clicked from inside a watched folder ran twice: the
+  runner launched it and recorded nothing, then the watcher launched it
+  again. The runner now records every success in handled.json (programs
+  and plug-ins), and a success clears any earlier failed record for the
+  same file, so one double-click means one run. The watcher also
+  re-reads handled.json on every pass, so the runner's record takes
+  effect even while the watcher is already running.
+
+Retry that works:
+
+- Retry on a file outside the watched folders used to clear the record
+  and say "the watcher will pick it up" - and nothing ever happened.
+  Retry now re-runs an outside file through the runner directly, in a
+  worker thread, and leaves the record in place until the runner
+  records the fresh outcome. Inside a watched folder it still hands
+  the file back to the watcher. If the file is gone, or WinLinx
+  cannot run that kind of file, Retry says so plainly instead of
+  pretending to try.
+
+Selection you can trust:
+
+- After ordinary session activity, refreshes left two rows selected
+  and actions acted on the wrong program. Every table fill now clears
+  the selection before rebuilding rows, and all four tables are
+  single-selection, so exactly one row is ever selected and actions
+  act on it.
+
+Plain words everywhere:
+
+- A failed bridge sync was logged twice (once technical, once plain).
+  It is now logged once, in plain words, at the layer that ran the
+  sync.
+- The own-prefix and Windows-version failure dialogs used to say only
+  "Wine is not installed". They now name the program and the next
+  step, like the launch dialog does.
+- The folder threats dialog now lists each file with its own threats
+  and asks about the right count ("Quarantine these 3 files so they
+  can't install or run?").
+- The "Folder left in place" log line for a .vst3 bundle in Programs
+  no longer tells the user to double-click a program that is not
+  there; it uses the same wording as the Failed Drops reason.
+- An unsupported file's reason now says it was left in place.
+- The .clap message ("bridged into ~/.clap") was checked against
+  real yabridge 5.1.1 with a real .clap plug-in: yabridge does bridge
+  a .clap from the VST3 folder into ~/.clap, so the message stands.
+  A real-PC check is still the closer for actual playback.
+
+Notifications:
+
+- Batched failure notifications name the files when three or fewer
+  share a reason, and a drop that fires several reasons at once gets
+  one summary notification instead of a stack of popups.
+- The runner's notifications now prefer notify-send, with zenity only
+  as a fallback, so a notification is not lost when zenity cannot
+  show a dialog.
+
+The manager, tidied:
+
+- The status after quarantine shows the filename, not the full path.
+- The row-number gutter is gone from all four tables.
+- The System tab log is coloured like the Activity tab (WARNING
+  amber, ERROR red).
+- Empty log views say "No activity yet" instead of showing a blank
+  white box (and "No warnings yet" when the warnings filter hides
+  everything).
+- Tables sort A-to-Z by default, and remember the user's last sort
+  between runs.
+
 ## 0.3 - 2026-11-16
 
 The rest of the 2026-11-16 dogfood review (tasks 3-45): everything the

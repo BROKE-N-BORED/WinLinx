@@ -3,6 +3,7 @@ Runs offscreen (QT_QPA_PLATFORM=offscreen); fake home via WINLINX_HOME."""
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,8 @@ from PySide6.QtGui import QIcon  # noqa: E402
 from PySide6.QtNetwork import QLocalSocket  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QDialog, QMessageBox, QPushButton, QWidget,
+    QApplication, QDialog, QFileDialog, QMessageBox, QPushButton,
+    QTableWidget, QWidget,
 )
 import manager  # noqa: E402
 
@@ -56,7 +58,7 @@ class ManagerTests(unittest.TestCase):
             "next_retry": 0, "time": "2026-11-12T09:04:00"}}
         (self.home / ".local" / "share" / "winlinx"
          / "handled.json").write_text(json.dumps(state))
-        self.window = manager.ManagerWindow()
+        self.window = manager.ManagerWindow(startup_update_check=False)
         self.window.show()
         self._wait_for_refresh()
 
@@ -697,6 +699,232 @@ class ManagerTests(unittest.TestCase):
         self.assertIn("FooApp", option.text)
         self.assertIn("…", option.text)
 
+    # -- v0.4 regression tests ------------------------------------
+
+    def test_tables_are_single_selection(self):
+        # Task 3: every action uses only the first selected row, so
+        # multi-select is meaningless - and it is what let two rows
+        # stay selected after a refresh.
+        for table in (self.window.programs_table,
+                      self.window.plugins_table,
+                      self.window.quarantine_table,
+                      self.window.failed_table):
+            self.assertEqual(
+                table.selectionMode(),
+                QTableWidget.SelectionMode.SingleSelection)
+
+    def test_no_row_number_gutter(self):
+        # Task 11: the vertical header (1, 2, 3...) is hidden on
+        # all four tables.
+        for table in (self.window.programs_table,
+                      self.window.plugins_table,
+                      self.window.quarantine_table,
+                      self.window.failed_table):
+            self.assertTrue(table.verticalHeader().isHidden())
+
+    def test_system_log_has_activity_colouring(self):
+        # Task 12: the System tab log carries the same WARNING /
+        # ERROR highlighter as the Activity tab.
+        highlighter = self.window._log_highlighter
+        self.assertIsNotNone(highlighter)
+        self.assertIsInstance(highlighter, manager.ActivityHighlighter)
+        self.assertIs(highlighter.document(),
+                      self.window.log_view.document())
+
+    def test_log_placeholders(self):
+        # Task 13: both log views say "No activity yet" when empty.
+        self.assertEqual(self.window.activity_view.placeholderText(),
+                         "No activity yet")
+        self.assertEqual(self.window.log_view.placeholderText(),
+                         "No activity yet")
+        # Warnings-only with activity but no warnings says so
+        # instead of pretending the log is empty.
+        self.window.activity_warnings_only.setChecked(True)
+        self.assertEqual(self.window.activity_view.placeholderText(),
+                         "No warnings yet")
+        self.assertEqual(self.window.activity_view.toPlainText(), "")
+        self.window.activity_warnings_only.setChecked(False)
+        self.assertEqual(self.window.activity_view.placeholderText(),
+                         "No activity yet")
+
+    def test_own_prefix_failure_names_program_and_next_step(self):
+        # Task 5: the own-prefix failure dialog matches the launch
+        # dialog - program name and next step, not a bare message.
+        prog = next(p for p in self.window._programs
+                    if p["name"] == "FooApp 2.0")
+        seen = []
+        with mock.patch.object(
+                manager.common, "ensure_program_prefix",
+                return_value=(False, "Wine is not installed")):
+            with mock.patch.object(
+                    QMessageBox, "warning",
+                    lambda *args: seen.append(args[2])):
+                self.window._toggle_own_prefix(prog, True)
+                self.assertTrue(self._wait_until(lambda: seen))
+        self.assertEqual(len(seen), 1)
+        self.assertIn("FooApp 2.0", seen[0])
+        self.assertIn("own prefix", seen[0])
+        self.assertIn("Re-run the installer", seen[0])
+        self._wait_for_refresh()
+
+    def test_windows_version_failure_names_program_and_next_step(self):
+        # Task 5: same treatment for the Windows-version dialog.
+        prog = next(p for p in self.window._programs
+                    if p["name"] == "FooApp 2.0")
+        seen = []
+        with mock.patch.object(manager, "confirm_destructive",
+                               return_value=True):
+            with mock.patch.object(
+                    manager.common, "set_program_windows_version",
+                    return_value=(False, "Wine is not installed")):
+                with mock.patch.object(
+                        QMessageBox, "warning",
+                        lambda *args: seen.append(args[2])):
+                    self.window._set_windows_version(prog, "win10")
+                    self.assertTrue(self._wait_until(lambda: seen))
+        self.assertEqual(len(seen), 1)
+        self.assertIn("FooApp 2.0", seen[0])
+        self.assertIn("Windows version", seen[0])
+        self.assertIn("Re-run the installer", seen[0])
+        self._wait_for_refresh()
+
+    def test_other_prefix_failure_still_names_program(self):
+        # Task 5: a non-Wine failure still names the program and
+        # keeps the real reason.
+        prog = next(p for p in self.window._programs
+                    if p["name"] == "FooApp 2.0")
+        seen = []
+        with mock.patch.object(
+                manager.common, "ensure_program_prefix",
+                return_value=(False,
+                              "the new prefix folder could not be "
+                              "created")):
+            with mock.patch.object(
+                    QMessageBox, "warning",
+                    lambda *args: seen.append(args[2])):
+                self.window._toggle_own_prefix(prog, True)
+                self.assertTrue(self._wait_until(lambda: seen))
+        self.assertIn("FooApp 2.0", seen[0])
+        self.assertIn("could not be created", seen[0])
+        self._wait_for_refresh()
+
+    def test_folder_threats_text_lists_each_file(self):
+        # Task 6: each infected file with its own threats, grouped.
+        text = manager.format_folder_threats_text(
+            "/tmp/scanme",
+            [("/tmp/scanme/a.exe", "Win.Trojan.A"),
+             ("/tmp/scanme/b.dll", "Win.Trojan.B"),
+             ("/tmp/scanme/c.vst3", "PUA.Adware.C"),
+             ("/tmp/scanme/a.exe", "Win.Trojan.A")])
+        self.assertIn("/tmp/scanme", text)
+        for name in ("a.exe", "b.dll", "c.vst3",
+                     "Win.Trojan.A", "Win.Trojan.B", "PUA.Adware.C"):
+            self.assertIn(name, text)
+        self.assertEqual(text.count("Win.Trojan.A"), 1)
+        self.assertLess(text.index("a.exe"),
+                        text.index("Win.Trojan.A"))
+        self.assertLess(text.index("Win.Trojan.A"),
+                        text.index("b.dll"))
+        self.assertLess(text.index("b.dll"),
+                        text.index("Win.Trojan.B"))
+
+    def test_folder_scan_dialog_lists_files_and_counts(self):
+        # Task 6: the folder dialog shows the file-to-threat
+        # mapping and asks a plural question; Leave it stays the
+        # default.
+        folder = self.home / "Downloads-fake" / "scanme"
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in ("a.exe", "b.dll", "c.vst3"):
+            (folder / name).write_bytes(b"x")
+        result = {"clean": False, "missing": False, "error": "",
+                  "threats": [
+                      (str(folder / "a.exe"), "Win.Trojan.A"),
+                      (str(folder / "b.dll"), "Win.Trojan.B"),
+                      (str(folder / "c.vst3"), "PUA.Adware.C")]}
+        captured = {}
+
+        def fake_exec(box):
+            captured["text"] = box.text()
+            captured["info"] = box.informativeText()
+            default = box.defaultButton()
+            captured["default"] = default.text() if default else None
+            return QDialog.DialogCode.Rejected
+
+        with mock.patch.object(manager.scanner, "scan_path",
+                               return_value=result):
+            with mock.patch.object(QMessageBox, "exec", fake_exec):
+                self.window._scan_target(str(folder))
+                self.assertTrue(self._wait_until(lambda: captured))
+        for name in ("a.exe", "b.dll", "c.vst3",
+                     "Win.Trojan.A", "Win.Trojan.B", "PUA.Adware.C"):
+            self.assertIn(name, captured["text"])
+        self.assertEqual(
+            captured["info"],
+            "Quarantine these 3 files so they can't install or run?")
+        self.assertEqual(captured["default"], "Leave it")
+
+    def test_single_file_scan_dialog_keeps_singular_question(self):
+        # Task 6: the single-file dialog is unchanged.
+        target = self.home / "Downloads-fake" / "one.exe"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x")
+        result = {"clean": False, "missing": False, "error": "",
+                  "threats": [(str(target), "Trojan.A"),
+                              (str(target), "Worm.B")]}
+        captured = {}
+
+        def fake_exec(box):
+            captured["text"] = box.text()
+            captured["info"] = box.informativeText()
+            return QDialog.DialogCode.Rejected
+
+        with mock.patch.object(manager.scanner, "scan_path",
+                               return_value=result):
+            with mock.patch.object(QMessageBox, "exec", fake_exec):
+                self.window._scan_target(str(target))
+                self.assertTrue(self._wait_until(lambda: captured))
+        self.assertIn("Trojan.A", captured["text"])
+        self.assertIn("Worm.B", captured["text"])
+        self.assertEqual(captured["info"],
+                         "Quarantine it so it can't install or run?")
+
+    def test_quarantine_status_shows_filename_not_path(self):
+        # Task 10: "Quarantined evil.exe", not the full path.
+        target = self.home / "Downloads-fake" / "evil.exe"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x")
+        result = {"clean": False, "missing": False, "error": "",
+                  "threats": [(str(target), "Evil.Thing")]}
+
+        def fake_exec(box):
+            buttons = [b for b in box.buttons()
+                       if b.text() == "Quarantine"]
+            self.assertTrue(buttons)
+            buttons[0].click()
+            return QDialog.DialogCode.Rejected
+
+        with mock.patch.object(manager.scanner, "scan_path",
+                               return_value=result):
+            with mock.patch.object(QMessageBox, "exec", fake_exec):
+                self.window._scan_target(str(target))
+                self.assertTrue(self._wait_until(
+                    lambda: self.window.statusBar().currentMessage()
+                    == "Quarantined evil.exe"))
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "Quarantined evil.exe")
+
+    def test_retry_inside_watched_folder_promises_watcher(self):
+        # Task 2: inside a watched folder the old behaviour is
+        # right - clear the record, the watcher picks it up.
+        import watcher
+        self._select_row(self.window.failed_table)
+        self.window._retry_failed()
+        self._wait_for_refresh()
+        status = self.window.statusBar().currentMessage()
+        self.assertIn("Retrying broken.exe", status)
+        self.assertIn("watcher will pick it up", status)
+        self.assertEqual(len(watcher.load_failed()), 0)
+
 
 class EmptyHomeTests(unittest.TestCase):
     """The manager on a fresh home: empty-state guidance, hidden
@@ -710,7 +938,7 @@ class EmptyHomeTests(unittest.TestCase):
         (self.home / "WinLinx" / "Programs").mkdir(parents=True)
         (self.home / "WinLinx" / "Plugins").mkdir(parents=True)
         (self.home / ".local" / "share" / "winlinx").mkdir(parents=True)
-        self.window = manager.ManagerWindow()
+        self.window = manager.ManagerWindow(startup_update_check=False)
         self.window.show()
         self._wait_for_refresh()
 
@@ -769,6 +997,16 @@ class EmptyHomeTests(unittest.TestCase):
                       self.window.watcher_hint_label.text())
         self.assertIn("Install or Repair",
                       self.window.repair_btn.text())
+
+    def test_empty_log_views_have_placeholder(self):
+        # v0.4 task 13: on a fresh home the Activity and System log
+        # views are not blank white boxes.
+        self.assertEqual(self.window.activity_view.toPlainText(), "")
+        self.assertEqual(self.window.log_view.toPlainText(), "")
+        self.assertEqual(self.window.activity_view.placeholderText(),
+                         "No activity yet")
+        self.assertEqual(self.window.log_view.placeholderText(),
+                         "No activity yet")
 
 
 class ManagerMainTests(unittest.TestCase):
@@ -898,6 +1136,389 @@ class ManagerMainTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stderr[-2000:])
         self.assertIn("cannot create", proc.stderr)
         self.assertNotIn("already running", proc.stderr)
+
+
+class V04RetryOutsideTests(unittest.TestCase):
+    """v0.4 task 2: Retry on a file OUTSIDE the watched folders
+    re-runs it through the runner path (fake wine proves it), and
+    never claims the watcher will pick it up. Adapted from the
+    v0.3 reviewer's drive_runner.py R3 scenario."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_home = os.environ.get("WINLINX_HOME")
+        os.environ["WINLINX_HOME"] = self._tmp.name
+        self.home = Path(self._tmp.name)
+        fakehome.build_fake_home(self.home)
+        downloads = self.home / "Downloads"
+        downloads.mkdir(parents=True, exist_ok=True)
+        (downloads / "dl2.exe").write_bytes(b"FAKEEXE")
+        (downloads / "dl-nowine.exe").write_bytes(b"FAKEEXE")
+        (downloads / "notes.txt").write_text("hello")
+        # gone.exe has a record but no file.
+        state = {}
+        for name, attempts in (("dl2.exe", 1), ("dl-nowine.exe", 1),
+                               ("notes.txt", 1), ("gone.exe", 1)):
+            state[str(downloads / name)] = {
+                "size": 1, "mtime": 1, "action": "failed",
+                "reason": "Wine is not installed", "attempts": attempts,
+                "next_retry": 0, "time": "2026-11-17T09:04:00"}
+        (self.home / ".local" / "share" / "winlinx"
+         / "handled.json").write_text(json.dumps(state))
+        # Fake wine: logs every invocation, exits 0.
+        self.fakebin = Path(self._tmp.name) / "fakebin"
+        self.fakebin.mkdir()
+        self.wine_log = self.fakebin / "wine.log"
+        (self.fakebin / "wine").write_text(
+            "#!/bin/bash\n"
+            "echo \"WINE: $*\" >> %s\n"
+            "exit 0\n" % self.wine_log)
+        (self.fakebin / "wine").chmod(0o755)
+        self.window = manager.ManagerWindow(startup_update_check=False)
+        self.window.show()
+        self._wait_for_refresh()
+
+    def tearDown(self):
+        self.window.close()
+        self.window.deleteLater()
+        _APP.processEvents()
+        if self._old_home is None:
+            os.environ.pop("WINLINX_HOME", None)
+        else:
+            os.environ["WINLINX_HOME"] = self._old_home
+        self._tmp.cleanup()
+
+    def _wait_for_refresh(self, timeout=20.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _APP.processEvents()
+            if self.window._worker is None:
+                return True
+            time.sleep(0.05)
+        return self.window._worker is None
+
+    def _wait_until(self, predicate, timeout=20.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _APP.processEvents()
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return predicate()
+
+    def _select_failed(self, name):
+        table = self.window.failed_table
+        for row in range(table.rowCount()):
+            if table.item(row, 0).text() == name:
+                table.selectRow(row)
+                _APP.processEvents()
+                return
+        self.fail("no Failed Drops row named %s" % name)
+
+    def _wine_invocations(self, name):
+        if not self.wine_log.exists():
+            return 0
+        return self.wine_log.read_text().count(name)
+
+    def test_retry_outside_runs_the_file(self):
+        # R3: Retry on dl2.exe (in Downloads, outside the watched
+        # folders) runs it - fake wine is invoked - and the status
+        # never mentions the watcher. A watcher pass afterwards
+        # does not run it a second time.
+        self._select_failed("dl2.exe")
+        path = (str(self.fakebin) + os.pathsep
+                + os.environ["PATH"])
+        with mock.patch.dict(os.environ, {"PATH": path}):
+            self.window._retry_failed()
+            self.assertTrue(self._wait_until(
+                lambda: self.window._worker is None
+                and "Retried dl2.exe"
+                in self.window.statusBar().currentMessage()))
+        self.assertEqual(self._wine_invocations("dl2.exe"), 1)
+        self.assertNotIn(
+            "watcher",
+            self.window.statusBar().currentMessage().lower())
+        env = dict(os.environ)
+        env["WINLINX_HOME"] = str(self.home)
+        env["HOME"] = str(self.home)
+        env["PATH"] = path
+        root = Path(__file__).resolve().parent.parent
+        subprocess.run(
+            [sys.executable, str(root / "winlinx" / "watcher.py"),
+             "--once"],
+            env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(self._wine_invocations("dl2.exe"), 1)
+
+    def test_retry_outside_without_wine_keeps_record_and_says_so(self):
+        if shutil.which("wine"):
+            self.skipTest("wine is installed here")
+        self._select_failed("dl-nowine.exe")
+        self.window._retry_failed()
+        self.assertTrue(self._wait_until(
+            lambda: self.window._worker is None
+            and "Still could not handle"
+            in self.window.statusBar().currentMessage()))
+        status = self.window.statusBar().currentMessage()
+        self.assertIn("dl-nowine.exe", status)
+        self.assertIn("Wine is not installed", status)
+        self.assertNotIn("watcher will pick it up", status)
+        import watcher
+        failed = [e for e in watcher.load_failed()
+                  if e["name"] == "dl-nowine.exe"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["attempts"], 2)
+
+    def test_retry_unsupported_file_keeps_record(self):
+        import watcher
+        self._select_failed("notes.txt")
+        seen = []
+        with mock.patch.object(
+                QMessageBox, "information",
+                lambda *args: seen.append(args[2])):
+            self.window._retry_failed()
+        self.assertEqual(len(seen), 1)
+        self.assertIn("notes.txt", seen[0])
+        self.assertIn("only handles", seen[0])
+        self.assertIn("Cannot retry",
+                      self.window.statusBar().currentMessage())
+        failed = [e for e in watcher.load_failed()
+                  if e["name"] == "notes.txt"]
+        self.assertEqual(len(failed), 1)
+
+    def test_retry_missing_file_keeps_record(self):
+        import watcher
+        self._select_failed("gone.exe")
+        self.window._retry_failed()
+        self.assertIn("no longer there",
+                      self.window.statusBar().currentMessage())
+        failed = [e for e in watcher.load_failed()
+                  if e["name"] == "gone.exe"]
+        self.assertEqual(len(failed), 1)
+
+
+class V04TriggerTests(unittest.TestCase):
+    """v0.4 task 3: the reviewer's trigger sequence (W2 / X1 / X2
+    drivers) followed by select + refresh on each table leaves
+    exactly one row selected, and actions act on it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_home = os.environ.get("WINLINX_HOME")
+        os.environ["WINLINX_HOME"] = self._tmp.name
+        self.home = Path(self._tmp.name)
+        fakehome.build_fake_home(self.home)
+        bad = self.home / "nasty.exe"
+        bad.write_bytes(b"x")
+        scanner.quarantine_item(bad, [(str(bad), "Evil.Thing")])
+        shady = self.home / "shady.dll"
+        shady.write_bytes(b"x")
+        scanner.quarantine_item(shady, [(str(shady), "Sneaky.Worm")])
+        state = {}
+        for folder, name in (("Programs", "broken.exe"),
+                             ("Plugins", "BigSynth.vst3")):
+            path = self.home / "WinLinx" / folder / name
+            state[str(path)] = {
+                "size": 1, "mtime": 1, "action": "failed",
+                "reason": "Wine is not installed", "attempts": 2,
+                "next_retry": 0, "time": "2026-11-12T09:04:00"}
+        (self.home / ".local" / "share" / "winlinx"
+         / "handled.json").write_text(json.dumps(state))
+        self.window = manager.ManagerWindow(startup_update_check=False)
+        self.window.show()
+        self._wait_for_refresh()
+
+    def tearDown(self):
+        self.window.close()
+        self.window.deleteLater()
+        _APP.processEvents()
+        if self._old_home is None:
+            os.environ.pop("WINLINX_HOME", None)
+        else:
+            os.environ["WINLINX_HOME"] = self._old_home
+        self._tmp.cleanup()
+
+    def _wait_for_refresh(self, timeout=20.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _APP.processEvents()
+            if self.window._worker is None:
+                return True
+            time.sleep(0.05)
+        return self.window._worker is None
+
+    def _row_for(self, table, name):
+        for row in range(table.rowCount()):
+            if table.item(row, 0).text() == name:
+                return row
+        self.fail("no row named %s" % name)
+
+    def test_trigger_sequence_keeps_one_selection_per_table(self):
+        window = self.window
+        window.activateWindow()
+        window.raise_()
+        _APP.processEvents()
+        # W2 history: Ctrl+R, F5, F1 open/close, Ctrl+I.
+        QTest.keyClick(window, Qt.Key.Key_R,
+                       Qt.KeyboardModifier.ControlModifier)
+        self._wait_for_refresh()
+        QTest.keyClick(window, Qt.Key.Key_F5)
+        self._wait_for_refresh()
+        QTest.keyClick(window, Qt.Key.Key_F1)
+        _APP.processEvents()
+        time.sleep(0.3)
+        if window._howto_dialog is not None:
+            window._howto_dialog.close()
+        _APP.processEvents()
+        window.activateWindow()
+        window.raise_()
+        _APP.processEvents()
+        pick = self.home / "Downloads-fake" / "ctrl-i.exe"
+        pick.parent.mkdir(parents=True, exist_ok=True)
+        pick.write_bytes(b"FAKEEXE")
+        orig_open = QFileDialog.getOpenFileName
+        QFileDialog.getOpenFileName = staticmethod(
+            lambda *a, **k: (str(pick), ""))
+        try:
+            QTest.keyClick(window, Qt.Key.Key_I,
+                           Qt.KeyboardModifier.ControlModifier)
+            self._wait_for_refresh()
+        finally:
+            QFileDialog.getOpenFileName = orig_open
+        # The trigger really ran: Ctrl+I copied the file.
+        self.assertTrue((self.home / "WinLinx" / "Programs"
+                         / "ctrl-i.exe").exists())
+        # X2: Ctrl+R four more times.
+        for _ in range(4):
+            QTest.keyClick(window, Qt.Key.Key_R,
+                           Qt.KeyboardModifier.ControlModifier)
+            self._wait_for_refresh()
+        cases = [
+            (window.programs_table, "MSI Thing"),
+            (window.plugins_table, "Remix.vst3"),
+            (window.quarantine_table, "shady.dll"),
+            (window.failed_table, "BigSynth.vst3"),
+        ]
+        for table, name in cases:
+            table.selectRow(self._row_for(table, name))
+            _APP.processEvents()
+            window.refresh()
+            self._wait_for_refresh()
+            selected = table.selectionModel().selectedRows()
+            self.assertEqual(len(selected), 1,
+                             "%s: %s selected after refresh"
+                             % (name, len(selected)))
+            self.assertEqual(
+                table.item(selected[0].row(), 0).text(), name)
+            data = window._selected_row_data(table)
+            self.assertIsNotNone(data, name)
+            self.assertEqual(data.get("name"), name)
+
+    def test_refresh_after_selected_row_vanishes_selects_nothing(self):
+        # Found while screenshotting v0.4: when the selected row's
+        # record disappears (e.g. a successful Retry), Qt moved the
+        # selection to row 0 - a row the user never chose - and the
+        # action buttons stayed enabled for it.
+        import watcher
+        window = self.window
+        table = window.failed_table
+        table.selectRow(self._row_for(table, "BigSynth.vst3"))
+        _APP.processEvents()
+        watcher.clear_handled(
+            str(self.home / "WinLinx" / "Plugins" / "BigSynth.vst3"))
+        window.refresh()
+        self._wait_for_refresh()
+        self.assertEqual(table.selectionModel().selectedRows(), [])
+        self.assertIsNone(window._selected_row_data(table))
+        self.assertFalse(window.retry_btn.isEnabled())
+        self.assertFalse(window.forget_btn.isEnabled())
+
+
+class V04SortTests(unittest.TestCase):
+    """v0.4 task 16: tables sort A-to-Z by default, and remember
+    the user's last sort."""
+
+    def setUp(self):
+        from PySide6.QtCore import QSettings
+        self._settings = QSettings("BrokeNBored", "WinLinx")
+        for key in ("programs", "plugins", "quarantine", "failed"):
+            self._settings.remove("sort/" + key)
+        self._settings.sync()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_home = os.environ.get("WINLINX_HOME")
+        os.environ["WINLINX_HOME"] = self._tmp.name
+        self.home = Path(self._tmp.name)
+        fakehome.build_fake_home(self.home)
+        bad = self.home / "nasty.exe"
+        bad.write_bytes(b"x")
+        scanner.quarantine_item(bad, [(str(bad), "Evil.Thing")])
+        self.window = manager.ManagerWindow(startup_update_check=False)
+        self.window.show()
+        self._wait_for_refresh()
+
+    def tearDown(self):
+        self.window.close()
+        self.window.deleteLater()
+        _APP.processEvents()
+        for key in ("programs", "plugins", "quarantine", "failed"):
+            self._settings.remove("sort/" + key)
+        self._settings.sync()
+        if self._old_home is None:
+            os.environ.pop("WINLINX_HOME", None)
+        else:
+            os.environ["WINLINX_HOME"] = self._old_home
+        self._tmp.cleanup()
+
+    def _wait_for_refresh(self, timeout=20.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _APP.processEvents()
+            if self.window._worker is None:
+                return True
+            time.sleep(0.05)
+        return self.window._worker is None
+
+    def _names(self, table):
+        return [table.item(r, 0).text()
+                for r in range(table.rowCount())]
+
+    def test_tables_sort_ascending_by_default(self):
+        self.assertEqual(self._names(self.window.programs_table),
+                         ["FooApp 2.0", "MSI Thing"])
+        self.assertEqual(self._names(self.window.plugins_table),
+                         ["Broken.vst3", "Lonely.vst3", "Remix.vst3"])
+        for table in (self.window.programs_table,
+                      self.window.plugins_table,
+                      self.window.quarantine_table,
+                      self.window.failed_table):
+            header = table.horizontalHeader()
+            self.assertEqual(header.sortIndicatorSection(), 0)
+            self.assertEqual(header.sortIndicatorOrder(),
+                             Qt.SortOrder.AscendingOrder)
+
+    def test_last_sort_is_remembered(self):
+        table = self.window.programs_table
+        table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        _APP.processEvents()
+        self.assertEqual(self._names(table),
+                         ["MSI Thing", "FooApp 2.0"])
+        # A refresh keeps the user's sort.
+        self.window.refresh()
+        self._wait_for_refresh()
+        self.assertEqual(self._names(table),
+                         ["MSI Thing", "FooApp 2.0"])
+        # A new window remembers it too.
+        self.window.close()
+        self.window.deleteLater()
+        _APP.processEvents()
+        self.window = manager.ManagerWindow(startup_update_check=False)
+        self.window.show()
+        self._wait_for_refresh()
+        self.assertEqual(self._names(self.window.programs_table),
+                         ["MSI Thing", "FooApp 2.0"])
+        self.assertEqual(
+            self.window.programs_table.horizontalHeader()
+            .sortIndicatorOrder(),
+            Qt.SortOrder.DescendingOrder)
 
 
 if __name__ == "__main__":

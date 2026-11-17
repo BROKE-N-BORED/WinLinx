@@ -72,13 +72,29 @@ class RunnerTests(unittest.TestCase):
         script.write_text("#!/bin/bash\n%s\n" % body)
         script.chmod(0o755)
 
-    def _run_runner(self, target):
-        subprocess.run(["bash", str(RUNNER), str(target)],
-                       env=self.env, timeout=60,
+    def _run_runner(self, target, env=None):
+        subprocess.run(["/bin/bash", str(RUNNER), str(target)],
+                       env=env if env is not None else self.env,
+                       timeout=60,
                        stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, check=False)
         # Notifications and the detached wine run are backgrounded.
         time.sleep(0.5)
+
+    def _run_watcher_once(self, env=None):
+        subprocess.run(
+            [sys.executable, str(REPO / "winlinx" / "watcher.py"),
+             "--once"],
+            env=env if env is not None else self.env, timeout=300,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False)
+        time.sleep(0.5)
+
+    def _handled_state(self):
+        path = self.layer / "handled.json"
+        if not path.is_file():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def _notifications(self):
         if not self.notify_log.is_file():
@@ -172,6 +188,28 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("could not be bridged", notes)
         self.assertIn("Bridges re-synced", self._log())
         self.assertEqual(self._failed(), {})
+        # The success is recorded, so the watcher will not copy and
+        # sync it again (v0.4 task 1).
+        record = self._handled_state()[str(target)]
+        self.assertEqual(record["action"], "bridged-vst3")
+        self.assertEqual(record["size"], target.stat().st_size)
+        self.assertEqual(record["mtime"], target.stat().st_mtime_ns)
+
+    def test_clap_with_working_yabridge_names_clap_folder(self):
+        # v0.4 task 7: yabridge 5.1.1 bridges a .clap sitting in
+        # the VST3 folder into ~/.clap, verified live with real
+        # yabridgectl and a real .clap plug-in, so the message
+        # names ~/.clap.
+        self._add_fake("yabridgectl", "exit 0")
+        target = self.downloads / "ClickFx.clap"
+        target.write_bytes(b"CLAPDATA")
+        self._run_runner(target)
+        notes = self._notifications()
+        self.assertIn("ClickFx.clap was bridged into ~/.clap for "
+                      "your DAW.", notes)
+        self.assertNotIn("could not be bridged", notes)
+        record = self._handled_state()[str(target)]
+        self.assertEqual(record["action"], "bridged-clap")
 
     def test_vst3_with_failing_yabridge_names_the_sync(self):
         self._add_fake("yabridgectl", "exit 1")
@@ -230,7 +268,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(failed["setup2.msi"]["reason"],
                          "Wine is not installed")
 
-    def test_exe_with_wine_runs_and_records_nothing(self):
+    def test_exe_with_wine_runs_and_records_handled(self):
         self._add_fake("wine", "echo \"WINE: $*\" >> %s" % self.wine_log)
         target = self.downloads / "clickme.exe"
         target.write_bytes(b"FAKEEXE")
@@ -239,6 +277,144 @@ class RunnerTests(unittest.TestCase):
         self.assertIn(str(target),
                       self.wine_log.read_text(encoding="utf-8"))
         self.assertEqual(self._failed(), {})
+        # The success is recorded in the watcher's format (v0.4
+        # task 1).
+        record = self._handled_state()[str(target)]
+        self.assertEqual(record["action"], "ran")
+        self.assertEqual(record["size"], target.stat().st_size)
+        self.assertEqual(record["mtime"], target.stat().st_mtime_ns)
+        self.assertTrue(record["time"])
+
+    def test_success_clears_earlier_failed_record(self):
+        # A file that failed before and now works is not still
+        # listed as failed (v0.4 task 1).
+        self._add_fake("wine", "echo \"WINE: $*\" >> %s" % self.wine_log)
+        target = self.downloads / "clickme.exe"
+        target.write_bytes(b"FAKEEXE")
+        # First double-click: no wine on PATH yet - remove the fake
+        # by running with a PATH that has only notify-send.
+        bindir = self.home / "nowine-bin"
+        bindir.mkdir()
+        shutil.copy2(self.fakebin / "notify-send",
+                     bindir / "notify-send")
+        env = dict(self.env)
+        env["PATH"] = "%s:/usr/bin:/bin" % bindir
+        self._run_runner(target, env=env)
+        self.assertIn("clickme.exe", self._failed())
+        # Wine appears; the second double-click succeeds.
+        self._run_runner(target)
+        self.assertEqual(self._failed(), {})
+        record = self._handled_state()[str(target)]
+        self.assertEqual(record["action"], "ran")
+        self.assertNotIn("attempts", record)
+        self.assertNotIn("reason", record)
+
+    # -- double-click inside a watched folder (v0.4 task 1, R2) ------
+
+    def test_double_click_in_programs_runs_once(self):
+        # The v0.3 review's R2: a program double-clicked from inside
+        # ~/WinLinx/Programs ran TWICE (runner, then watcher). The
+        # runner now records the success, so the watcher pass runs
+        # nothing.
+        self._add_fake("wine", "echo \"WINE: $*\" >> %s" % self.wine_log)
+        programs = self.home / "WinLinx" / "Programs"
+        programs.mkdir(parents=True)
+        target = programs / "game2.exe"
+        target.write_bytes(b"FAKEEXE")
+        self._run_runner(target)
+        # The record is there immediately after the double-click.
+        record = self._handled_state()[str(target)]
+        self.assertEqual(record["action"], "ran")
+        self.assertEqual(self.wine_log.read_text(
+            encoding="utf-8").count("WINE:"), 1)
+        self._run_watcher_once()
+        self.assertEqual(self.wine_log.read_text(
+            encoding="utf-8").count("WINE:"), 1)
+
+    def test_plugin_double_click_in_plugins_syncs_once(self):
+        # Same root cause for plug-ins: a .vst3 double-clicked from
+        # inside ~/WinLinx/Plugins was re-copied and re-synced by
+        # the watcher.
+        yab_log = self.home / "yab.log"
+        self._add_fake("yabridgectl",
+                       "echo \"YAB: $*\" >> %s" % yab_log)
+        plugins = self.home / "WinLinx" / "Plugins"
+        plugins.mkdir(parents=True)
+        target = plugins / "ClickSynth.vst3"
+        target.write_bytes(b"VST3DATA")
+        self._run_runner(target)
+        record = self._handled_state()[str(target)]
+        self.assertEqual(record["action"], "bridged-vst3")
+        self.assertEqual(yab_log.read_text(
+            encoding="utf-8").count("YAB:"), 1)
+        self._run_watcher_once()
+        self.assertEqual(yab_log.read_text(
+            encoding="utf-8").count("YAB:"), 1)
+
+    def test_bundle_double_click_in_plugins_syncs_once(self):
+        # A .vst3 bundle folder is recorded with the watcher's
+        # directory fingerprint (size 0), or the watcher would see a
+        # mismatched record and sync it again.
+        yab_log = self.home / "yab.log"
+        self._add_fake("yabridgectl",
+                       "echo \"YAB: $*\" >> %s" % yab_log)
+        plugins = self.home / "WinLinx" / "Plugins"
+        plugins.mkdir(parents=True)
+        bundle = plugins / "ClickBundle.vst3"
+        (bundle / "Contents").mkdir(parents=True)
+        (bundle / "Contents" / "Bundle.so").write_bytes(b"BUNDLEBIN")
+        self._run_runner(bundle)
+        record = self._handled_state()[str(bundle)]
+        self.assertEqual(record["action"], "bridged-vst3-dir")
+        self.assertEqual(record["size"], 0)
+        self.assertEqual(record["mtime"], bundle.stat().st_mtime_ns)
+        self.assertEqual(yab_log.read_text(
+            encoding="utf-8").count("YAB:"), 1)
+        self._run_watcher_once()
+        self.assertEqual(yab_log.read_text(
+            encoding="utf-8").count("YAB:"), 1)
+
+    # -- notifications prefer notify-send (v0.4 task 9) ---------------
+
+    def test_notify_send_used_when_zenity_fails(self):
+        # A zenity that exists but cannot show a dialog used to lose
+        # the notification entirely. notify-send is now preferred,
+        # so the broken zenity is never even called.
+        zen_log = self.home / "zenity.log"
+        self._add_fake("zenity",
+                       "echo \"ZENITY: $*\" >> %s\nexit 1" % zen_log)
+        target = self.downloads / "clickme.exe"
+        target.write_bytes(b"FAKEEXE")
+        self._run_runner(target)
+        self.assertIn("Wine is not installed, so clickme.exe cannot "
+                      "run.", self._notifications())
+        self.assertFalse(zen_log.is_file())
+
+    def test_zenity_fallback_without_notify_send(self):
+        # With no notify-send anywhere on PATH, a working zenity is
+        # still used. The PATH here is a bare directory with only
+        # the tools the runner needs, so a real notify-send in
+        # /usr/bin cannot leak into the test.
+        zendir = self.home / "zen-only"
+        zendir.mkdir()
+        zen_log = self.home / "zenity.log"
+        (zendir / "zenity").write_text(
+            "#!/bin/bash\n"
+            "echo \"ZENITY: $*\" >> %s\n" % zen_log)
+        (zendir / "zenity").chmod(0o755)
+        for tool in ("python3", "tr", "basename", "date"):
+            src = shutil.which(tool)
+            self.assertIsNotNone(src, tool)
+            os.symlink(src, zendir / tool)
+        env = dict(self.env)
+        env["PATH"] = str(zendir)
+        target = self.downloads / "clickme.exe"
+        target.write_bytes(b"FAKEEXE")
+        self._run_runner(target, env=env)
+        self.assertTrue(zen_log.is_file())
+        self.assertIn("Wine is not installed, so clickme.exe cannot "
+                      "run.", zen_log.read_text(encoding="utf-8"))
+        self.assertFalse(self.notify_log.is_file())
 
     # -- the record matches the watcher format (task 36) --------------
 
@@ -268,7 +444,7 @@ class RunnerTests(unittest.TestCase):
                               env=self.env, timeout=30,
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("WinLinx runner 0.3", proc.stdout)
+        self.assertIn("WinLinx runner 0.4", proc.stdout)
 
 
 if __name__ == "__main__":

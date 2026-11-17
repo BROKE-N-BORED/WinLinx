@@ -184,7 +184,7 @@ class ScanPluginsTests(CommonTestBase):
 
 class VersionTests(CommonTestBase):
     def test_version_is_single_sourced(self):
-        self.assertEqual(common.__version__, "0.3")
+        self.assertEqual(common.__version__, "0.4")
 
     def test_parse_version(self):
         self.assertEqual(common._parse_version("v0.2"), (0, 2))
@@ -282,7 +282,7 @@ class DebugLogTests(CommonTestBase):
         self.assertIsNotNone(report)
         self.assertTrue(report.is_file())
         text = report.read_text(encoding="utf-8")
-        self.assertIn("WinLinx version: 0.3", text)
+        self.assertIn("WinLinx version: 0.4", text)
         self.assertNotIn("SHOULDNOTAPPEAR", text)
         self.assertNotIn(str(self.home), text)
         self.assertIn("~", text)
@@ -343,13 +343,19 @@ class SyncPlainWordsTests(CommonTestBase):
         self.assertIn("yabridge is not installed", message)
         self.assertIn("can't be bridged", message)
 
-    def test_sync_failure_logs_tool_name(self):
+    def test_sync_failure_logs_plain_words_once(self):
+        # v0.4 task 4: the failure is logged once, at the common
+        # layer, in the same plain words the user sees - never the
+        # tool name, and callers must not log it again.
         import unittest.mock as mock
         with mock.patch.object(common, "find_yabridgectl",
                                return_value=None):
             common.run_yabridgectl_sync()
-        self.assertIn("yabridgectl",
-                      common.read_log_tail(10))
+        tail = common.read_log_tail(10)
+        self.assertIn("yabridge is not installed, so plug-ins can't "
+                      "be bridged", tail)
+        self.assertNotIn("yabridgectl", tail)
+        self.assertEqual(tail.count("yabridge is not installed"), 1)
 
     def test_plain_drop_reason(self):
         self.assertEqual(

@@ -3,6 +3,7 @@ Wine runs, VST bridging. Wine and clamscan are stubbed out; the
 executor records every call."""
 
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -19,6 +20,8 @@ import common  # noqa: E402
 import scanner  # noqa: E402
 import watcher  # noqa: E402
 import fakehome  # noqa: E402
+
+REPO = Path(__file__).resolve().parent.parent
 
 
 class StubExecutor:
@@ -130,6 +133,39 @@ class WatcherTests(unittest.TestCase):
         # Third pass: already handled, not run again.
         self._settle()
         self.assertEqual(len(self.executor.detached), 1)
+
+    def test_runner_success_visible_to_running_watcher(self):
+        # v0.4 task 1, daemon case: this Watcher instance was created
+        # BEFORE the double-click. It must still see the runner's
+        # record (via the per-pass reload) and not run the file a
+        # second time. Drives the real runner with a fake wine.
+        self._stub_scan()
+        self._stub_wine()
+        target = self._drop(self.programs, "game.exe")
+        fakebin = self.home / "fakebin"
+        fakebin.mkdir()
+        wine_log = self.home / "wine.log"
+        (fakebin / "wine").write_text(
+            "#!/bin/bash\necho \"WINE: $*\" >> %s\n" % wine_log)
+        (fakebin / "wine").chmod(0o755)
+        env = dict(os.environ)
+        env["HOME"] = str(self.home)
+        env["WINLINX_HOME"] = str(self.home)
+        env["PATH"] = "%s:/usr/bin:/bin" % fakebin
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        subprocess.run(
+            ["/bin/bash",
+             str(REPO / "winlinx" / "run-windows-file"), str(target)],
+            env=env, timeout=60,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False)
+        time.sleep(0.5)
+        self.assertEqual(wine_log.read_text(encoding="utf-8")
+                         .count("WINE:"), 1)
+        state = watcher._load_state()
+        self.assertEqual(state[str(target)]["action"], "ran")
+        self._settle()
+        self.assertEqual(self.executor.detached, [])
 
     def test_unrelated_files_do_not_run_but_show_as_failed(self):
         # Unsupported drops are no longer ignored: they never run,
@@ -364,6 +400,18 @@ class WatcherTests(unittest.TestCase):
                          watcher.UNSUPPORTED_REASON)
         self.assertNotIn("Unzip", failed[0]["reason"])
 
+    def test_txt_drop_reason_says_left_in_place(self):
+        # v0.4 task 15: the reason says what happened to the file.
+        self._stub_scan()
+        self._drop(self.programs, "readme.txt")
+        self._settle()
+        failed = watcher.load_failed()
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(
+            failed[0]["reason"],
+            "This file type isn't handled - it was left in place. "
+            "WinLinx handles .exe, .msi, .vst3, .dll and .clap files.")
+
     def test_unsupported_file_not_scanned(self):
         scan = self._stub_scan()
         self._drop(self.plugins, "plugin.zip")
@@ -437,6 +485,21 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(failed[0]["reason"],
                          watcher.FOLDER_VST3_IN_PROGRAMS_REASON)
 
+    def test_vst3_folder_in_programs_log_uses_folder_reason(self):
+        # v0.4 task 14: the log line for a .vst3 bundle in Programs
+        # must not say "double-click the program inside to run it" -
+        # there is no program inside a plug-in bundle.
+        self._stub_scan()
+        bundle = self.programs / "Misplaced.vst3"
+        bundle.mkdir()
+        (bundle / "plugin.bin").write_bytes(b"x")
+        self._settle()
+        log = common.log_path().read_text(encoding="utf-8")
+        self.assertIn("Folder scanned clean, left in place: "
+                      "Misplaced.vst3 (Plug-ins go in the Plugins "
+                      "folder", log)
+        self.assertNotIn("double-click the program inside", log)
+
     # -- sync failures (v0.3 tasks 35, 32) ---------------------------
 
     def test_sync_failure_reason_is_plain_words(self):
@@ -459,6 +522,32 @@ class WatcherTests(unittest.TestCase):
             "bridged")
         log = common.log_path().read_text(encoding="utf-8")
         self.assertNotIn("yabridgectl", log)
+
+    def test_sync_failure_logged_once_in_plain_words(self):
+        # v0.4 task 4: a failed sync is logged once, in plain words.
+        # The log line comes from common.run_yabridgectl_sync itself
+        # (real executor, no yabridge); the watcher adds no second
+        # line. The Failed Drops reason stays the watcher's wording.
+        self._stub_scan()
+        self.w = watcher.Watcher(executor=watcher.Executor())
+        p = mock.patch.object(watcher.common, "find_yabridgectl",
+                              return_value=None)
+        p.start()
+        self._patches.append(p)
+        self._drop(self.plugins, "Chorus.vst3", b"VST3DATA")
+        self._settle()
+        log = common.log_path().read_text(encoding="utf-8")
+        self.assertEqual(
+            log.count("yabridge is not installed, so plug-ins can't "
+                      "be bridged"), 1)
+        self.assertNotIn("yabridgectl", log)
+        self.assertNotIn("bridge sync failed", log)
+        failed = watcher.load_failed()
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(
+            failed[0]["reason"],
+            "yabridge is not installed, so the plug-in could not be "
+            "bridged")
 
     def test_installer_sync_failure_notifies_once(self):
         # An installer .exe in Plugins that installs fine but fails
@@ -489,6 +578,8 @@ class WatcherTests(unittest.TestCase):
     # -- batched failure notifications (v0.3 task 32) ----------------
 
     def test_same_reason_failures_coalesce(self):
+        # v0.4 task 8: three or fewer files sharing a reason are
+        # named instead of counted.
         notify = self._stub_notify()
         self._stub_scan()
         self._stub_wine(present=False)
@@ -499,7 +590,34 @@ class WatcherTests(unittest.TestCase):
         self.w._flush_failure_notifications()
         notify.assert_called_once_with(
             "WinLinx",
-            "3 files could not be handled: Wine is not installed - "
+            "one.exe, three.exe and two.exe could not be handled: "
+            "Wine is not installed - see the WinLinx Program "
+            "Manager.")
+
+    def test_two_failures_name_both_files(self):
+        notify = self._stub_notify()
+        self._stub_scan()
+        self._stub_wine(present=False)
+        self._drop(self.programs, "one.exe")
+        self._drop(self.programs, "two.exe")
+        self._settle()
+        self.w._flush_failure_notifications()
+        notify.assert_called_once_with(
+            "WinLinx",
+            "one.exe and two.exe could not be handled: Wine is not "
+            "installed - see the WinLinx Program Manager.")
+
+    def test_four_failures_use_count(self):
+        notify = self._stub_notify()
+        self._stub_scan()
+        self._stub_wine(present=False)
+        for name in ("a.exe", "b.exe", "c.exe", "d.exe"):
+            self._drop(self.programs, name)
+        self._settle()
+        self.w._flush_failure_notifications()
+        notify.assert_called_once_with(
+            "WinLinx",
+            "4 files could not be handled: Wine is not installed - "
             "see the WinLinx Program Manager.")
 
     def test_single_failure_notification_names_the_file(self):
@@ -514,7 +632,9 @@ class WatcherTests(unittest.TestCase):
             "game.exe could not be handled: Wine is not installed - "
             "see the WinLinx Program Manager.")
 
-    def test_different_reasons_notify_separately(self):
+    def test_different_reasons_notify_once_as_summary(self):
+        # v0.4 task 8: one summary notification per drop when many
+        # reasons fire at once, one line per reason.
         notify = self._stub_notify()
         self._stub_scan()
         self._stub_wine(present=False)
@@ -522,12 +642,13 @@ class WatcherTests(unittest.TestCase):
         self._drop(self.plugins, "plugin.zip")
         self._settle()
         self.w._flush_failure_notifications()
-        self.assertEqual(notify.call_count, 2)
-        messages = [call[0][1] for call in notify.call_args_list]
-        self.assertTrue(any("game.exe could not be handled" in m
-                            for m in messages))
-        self.assertTrue(any("plugin.zip could not be handled" in m
-                            for m in messages))
+        notify.assert_called_once()
+        message = notify.call_args[0][1]
+        self.assertIn("game.exe could not be handled: Wine is not "
+                      "installed", message)
+        self.assertIn("plugin.zip could not be handled: Unzip it "
+                      "first", message)
+        self.assertIn("See the WinLinx Program Manager.", message)
 
     def test_next_scan_flushes_failure_notifications(self):
         notify = self._stub_notify()

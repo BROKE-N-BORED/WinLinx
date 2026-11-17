@@ -572,8 +572,9 @@ def step_files(ctx):
     # Same module list as install.sh (cp winlinx/*.py): every module
     # in the winlinx folder ships, so the two install paths cannot
     # drift apart.
-    for name in ("__init__.py", "common.py", "installer.py",
-                 "manager.py", "scanner.py", "watcher.py"):
+    for name in ("__init__.py", "apply_update.py", "common.py",
+                 "installer.py", "manager.py", "scanner.py",
+                 "updater.py", "watcher.py"):
         ok = ctx.copy(SRC_DIR / "winlinx" / name, dest / name) and ok
     ok = ctx.copy(SRC_DIR / "winlinx" / "run-windows-file",
                   dest / "run-windows-file") and ok
